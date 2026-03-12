@@ -20,7 +20,8 @@ function res = analyze_transfer_curves(data, varargin)
 %
 % OUTPUT:
 %   res.PerCurve(k) with fields:
-%       Vd, Ioff_est, Vg_win[1x2], idx_win, slope_dec_per_V, intercept_dec, SS_mV_dec
+%       Vd, Ioff_est, Vg_win[1x2], idx_win, slope_dec_per_V, intercept_dec, SS_mV_dec,
+%       SS_fit_R2 (R² of SS linear fit), Von_fit_R2 (R² of Von linear fit), ...
 %   res.Summary : table across curves
 %   res.Figures : figure handles when DoPlot is true
 %
@@ -71,6 +72,7 @@ function res = analyze_transfer_curves(data, varargin)
         'slope_dec_per_V', NaN, ...
         'intercept_dec', NaN, ...
         'SS_mV_dec', NaN, ...
+        'SS_fit_R2', NaN, ...
         'Ion_Ioff_ratio', NaN, ...
         'gm_max', NaN, ...
         'Vth', NaN, ...
@@ -78,7 +80,8 @@ function res = analyze_transfer_curves(data, varargin)
         'Vth_extrap_Iref', NaN, ...
         'Vth_gmmax', NaN, ...
         'Vth_extrap_cross', NaN, ...
-        'Von', NaN ...
+        'Von', NaN, ...
+        'Von_fit_R2', NaN ...
     ), 1, nC);
 
     % -------- Overview figure --------
@@ -201,6 +204,17 @@ function res = analyze_transfer_curves(data, varargin)
         end
         [a,b] = linefit_dec(vX, vY);  % dec per V
 
+        % R² of SS fit: log10(|Id|) = a*Vg + b
+        if numel(vX) >= 2
+            yhat_ss = a*vX + b;
+            ybar_ss = mean(vY);
+            ss_tot_ss = sum((vY - ybar_ss).^2);
+            ss_res_ss = sum((vY - yhat_ss).^2);
+            R2_SS = 1 - ss_res_ss / max(ss_tot_ss, eps);
+        else
+            R2_SS = NaN;
+        end
+
         % Subthreshold swing
         SS_mV_dec = (1 / max(a, eps)) * 1e3;
 
@@ -273,6 +287,7 @@ function res = analyze_transfer_curves(data, varargin)
                 ss_tot = sum((Id_valid(sel)-ybar).^2);
                 ss_res = sum((Id_valid(sel)-yhat).^2);
                 R2 = 1 - ss_res/max(ss_tot, eps);
+                PerCurve(k).Von_fit_R2 = R2;  % 保存 Von 线性拟合的 R²（无论是否采纳 Von）
                 if isfinite(a_lin) && abs(a_lin) >= opt.MinVonSlope && R2 >= opt.MinVonR2
                     Von = -b_lin / a_lin; % intercept with Id=0 on linear scale
                 end
@@ -307,6 +322,7 @@ function res = analyze_transfer_curves(data, varargin)
         PerCurve(k).slope_dec_per_V = a;
         PerCurve(k).intercept_dec = b;
         PerCurve(k).SS_mV_dec = SS_mV_dec;
+        PerCurve(k).SS_fit_R2 = R2_SS;
         PerCurve(k).Ion_Ioff_ratio = Ion_Ioff_ratio;
         PerCurve(k).gm_max = gm_max;
         PerCurve(k).Vth = Vth;
@@ -660,9 +676,19 @@ function res = analyze_transfer_curves(data, varargin)
     Vth_gmmax_col = arrayfun(@(x)x.Vth_gmmax, PerCurve).';
     
     Von_col = arrayfun(@(x)x.Von, PerCurve).';
+    if isfield(PerCurve, 'SS_fit_R2')
+        SS_fit_R2_col = arrayfun(@(x)x.SS_fit_R2, PerCurve).';
+    else
+        SS_fit_R2_col = NaN(nC, 1);
+    end
+    if isfield(PerCurve, 'Von_fit_R2')
+        Von_fit_R2_col = arrayfun(@(x)x.Von_fit_R2, PerCurve).';
+    else
+        Von_fit_R2_col = NaN(nC, 1);
+    end
     res.PerCurve = PerCurve;
-    res.Summary = table(Vd_col, SS_col, VgL, VgR, Ioff_col, Slope_col, Ion_Ioff_col, gm_max_col, Vth_col, Vth_Ioff_col, Vth_Iref_col, Vth_cross_col, Vth_gmmax_col, Von_col, ...
-        'VariableNames', {'Vd','SS_mV_per_dec','Vg_left','Vg_right','Ioff_est','slope_dec_per_V','Ion_Ioff_ratio','gm_max','Vth','Vth_extrap_Ioff','Vth_extrap_Iref','Vth_extrap_cross','Vth_gmmax','Von'});
+    res.Summary = table(Vd_col, SS_col, SS_fit_R2_col, VgL, VgR, Ioff_col, Slope_col, Ion_Ioff_col, gm_max_col, Vth_col, Vth_Ioff_col, Vth_Iref_col, Vth_cross_col, Vth_gmmax_col, Von_col, Von_fit_R2_col, ...
+        'VariableNames', {'Vd','SS_mV_per_dec','SS_fit_R2','Vg_left','Vg_right','Ioff_est','slope_dec_per_V','Ion_Ioff_ratio','gm_max','Vth','Vth_extrap_Ioff','Vth_extrap_Iref','Vth_extrap_cross','Vth_gmmax','Von','Von_fit_R2'});
     res.Figures = figs;
 end
 
@@ -714,13 +740,25 @@ function curves = normalize_input_as_columns(data)
 end
 
 function [a,b] = linefit_dec(x, y)
-    % Linear fit y = a*x + b. Use robustfit if available.
+    % Linear fit y = a*x + b. Use robustfit if available; fallback to \ on failure or warning.
+    X = [ones(numel(x),1), x(:)];
+    y = y(:);
     if exist('robustfit','file')
-        coef = robustfit(x,y);  % y = coef(1) + coef(2)*x
-        b = coef(1); a = coef(2);
+        try
+            warnState = warning('off', 'stats:statrobustfit:IterationLimit');
+            coef = robustfit(x, y);
+            warning(warnState);
+            b = coef(1); a = coef(2);
+            if ~isfinite(a) || ~isfinite(b)
+                coef = X \ y;
+                b = coef(1); a = coef(2);
+            end
+        catch
+            coef = X \ y;
+            b = coef(1); a = coef(2);
+        end
     else
-        X = [ones(numel(x),1), x(:)];
-        coef = X \ y(:);
+        coef = X \ y;
         b = coef(1); a = coef(2);
     end
 end
