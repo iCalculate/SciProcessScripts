@@ -1,0 +1,297 @@
+╔════════════════════════════════════════════════════════════════════════════════╗
+║                       SHG-Analyzer 使用指南                                      ║
+║               Second Harmonic Generation Spectroscopy Analysis Toolkit           ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+
+📌 项目简介
+═══════════════════════════════════════════════════════════════════════════════
+
+SHG-Analyzer 是一个完整的MATLAB工具集，用于：
+  • 绘制和分析二次谐波(SHG)光谱
+  • 分析功率扫描数据的功率依赖性
+  • 进行幂律拟合 (I ∝ P^n)
+  • 可视化多维光谱数据
+
+核心特性：
+  ✓ 模块化架构，易于扩展
+  ✓ 三种主要绘图方式（单条、堆叠、等高线）
+  ✓ 多种归一化方法
+  ✓ 内置功率拟合分析
+  ✓ 与PL-Analyzer和Raman-Analyzer兼容
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🚀 快速开始（3步）
+═══════════════════════════════════════════════════════════════════════════════
+
+第1步: 准备数据
+  └─ 创建 SHGData 结构体，包含 .data 和 .axisscale 字段
+
+第2步: 选择绘图函数
+  ├─ plot_single_shg()     → 单条光谱 (最简单)
+  ├─ plot_shg_stack()      → 多条堆叠 (最常用)
+  └─ plot_shg_contour()    → 等高线热图 (最直观)
+
+第3步: 运行绘制
+  └─ [fig, ax] = plot_shg_*(data, varargin)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+📂 项目文件说明
+═══════════════════════════════════════════════════════════════════════════════
+
+【核心模块】
+  core/
+  ├─ visualization/   → 三个绘图函数
+  │  ├─ plot_single_shg.m          ⭐ 单条光谱
+  │  ├─ plot_shg_stack.m           ⭐ 堆叠图
+  │  └─ plot_shg_contour.m         ⭐ 等高线
+  │
+  ├─ data/           → 数据导入函数
+  │  ├─ import_shg_data.m          加载单个文件
+  │  └─ load_shg_power_data.m      加载功率标定数据
+  │
+  └─ analysis/       → 分析函数
+     ├─ normalize_shg_spectrum.m   归一化处理
+     └─ shg_power_fitting.m        功率拟合分析
+
+【示例文件】
+  examples/
+  ├─ basic_plotting.m          基础绘图示例 ⭐ 推荐首先查看
+  └─ power_dependence.m        功率依赖性分析示例
+
+【帮助文档】
+  ├─ QUICKSTART.m              5分钟快速开始
+  ├─ README.md                 详细说明文档
+  └─ USAGE_GUIDE.txt           本文件
+
+═══════════════════════════════════════════════════════════════════════════════
+
+📖 标准工作流程
+═══════════════════════════════════════════════════════════════════════════════
+
+【工作流 1】快速查看单条或几条光谱（推荐时间：5分钟）
+
+  步骤：
+  1. 准备数据：
+     wavelength = 400:5:900;           % nm
+     spectrum = randn(1, 101);         % 模拟光谱
+  
+  2. 绘制：
+     plot_single_shg(spectrum, wavelength, 'Title', 'My SHG');
+  
+  3. 保存图像：
+     savefig(gcf, 'my_shg.fig');
+     print(gcf, 'my_shg.png', '-dpng', '-r300');
+
+═══════════════════════════════════════════════════════════════════════════════
+
+【工作流 2】分析功率扫描数据的整体特性（推荐时间：15分钟）
+
+  步骤：
+  1. 组织数据：
+     powers = 0.1:0.1:2.0;             % 20个功率点
+     wavelength = 400:5:900;           % 101个波长点
+     data = randn(20, 101);            % 20×101 矩阵
+     
+     SHGData.data = data;
+     SHGData.axisscale{1,1} = powers';
+     SHGData.axisscale{2,1} = wavelength';
+  
+  2. 绘制等高线热图（整体观察）：
+     plot_shg_contour(SHGData, 'Colormap', 'hot');
+  
+  3. 绘制堆叠图（细节对比）：
+     plot_shg_stack(SHGData, ...
+         'NormalizeMethod', 'max', ...
+         'Spacing', 0.15);
+
+═══════════════════════════════════════════════════════════════════════════════
+
+【工作流 3】深入分析功率依赖性（推荐时间：30分钟）
+
+  步骤：
+  1. 加载或组织数据（同工作流2）
+  
+  2. 提取特定波长的数据：
+     [~, idx] = min(abs(wavelength - 650));  % 650 nm
+     intensity = SHGData.data(:, idx);
+  
+  3. 进行幂律拟合：
+     [fitresult, gof] = shg_power_fitting(powers, intensity, ...
+         'ModelType', 'power', ...
+         'Plot', true);
+  
+  4. 查看结果：
+     fprintf('模型: %s\n', fitresult.model);
+     fprintf('R² = %.6f\n', gof.rsquare);
+     fprintf('幂指数: %.4f (应接近 2.0)\n', fitresult.exponent);
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🔧 常用代码片段
+═══════════════════════════════════════════════════════════════════════════════
+
+【片段1】从.mat文件加载数据
+  SHGData = import_shg_data('my_shg_data.mat');
+
+【片段2】创建并规范化SHGData结构
+  powers = 0.05:0.05:1.0;
+  wavelength = 400:5:900;
+  data = randn(length(powers), length(wavelength));
+  
+  SHGData.data = data;
+  SHGData.axisscale{1,1} = powers';
+  SHGData.axisscale{2,1} = wavelength';
+
+【片段3】绘制等高线图
+  figure('Position', [100 100 900 600]);
+  plot_shg_contour(SHGData, ...
+      'ContourLevels', 50, ...
+      'Colormap', 'hot', ...
+      'Title', 'SHG Intensity Map', ...
+      'ParamLabel', 'Power (mW)');
+
+【片段4】绘制堆叠图
+  figure('Position', [1050 100 900 600]);
+  plot_shg_stack(SHGData, ...
+      'Indices', 1:3:size(SHGData.data,1), ...
+      'NormalizeMethod', 'peak_range', ...
+      'PeakRange', [600 700], ...
+      'Spacing', 0.15, ...
+      'Colormap', 'power');
+
+【片段5】功率依赖性拟合
+  [~, idx] = min(abs(wavelength - 650));
+  intensity = SHGData.data(:, idx);
+  [fitresult, gof] = shg_power_fitting(powers, intensity, 'Plot', true);
+
+【片段6】多波长拟合（提取波长依赖的幂指数）
+  test_wavelengths = 600:20:700;
+  exponents = [];
+  
+  for wl = test_wavelengths
+      [~, wl_idx] = min(abs(wavelength - wl));
+      intensity = SHGData.data(:, wl_idx);
+      [fitresult, ~] = shg_power_fitting(powers, intensity);
+      exponents = [exponents; fitresult.exponent];
+  end
+
+═══════════════════════════════════════════════════════════════════════════════
+
+⚙️ 常用参数表
+═══════════════════════════════════════════════════════════════════════════════
+
+plot_single_shg 参数：
+  'Title'           - 图形标题 (默认: '')
+  'LineColor'       - 线条颜色 (默认: 'r')
+  'LineWidth'       - 线宽 (默认: 2)
+  'FontSize'        - 字体大小 (默认: 12)
+  'LabelFontSize'   - 标签字体大小 (默认: 14)
+  'ShowGrid'        - 显示网格 (默认: true)
+  'LogScale'        - 使用对数Y轴 (默认: false)
+
+plot_shg_stack 参数：
+  'Indices'         - 要绘制的行索引 (默认: 全部)
+  'WavelengthRange' - 波长范围 [min max] nm (默认: 全部)
+  'NormalizeMethod' - 归一化方法: 'none'/'max'/'peak_range'/'area'
+  'PeakRange'       - 峰值范围 [min max] nm (默认: [300 800])
+  'Spacing'         - 曲线间距 (默认: 0.1, 范围 0.05-0.3)
+  'Colormap'        - 颜色模式: 'power'/'index'/'jet'/'hot'/'cool'
+  'Title'           - 图形标题
+  'FontSize'        - 字体大小 (默认: 12)
+  'LabelFontSize'   - 标签字体大小 (默认: 14)
+
+plot_shg_contour 参数：
+  'WavelengthRange' - 波长范围 [min max] nm (默认: 全部)
+  'ColorRange'      - 强度范围 [min max] (默认: 自动)
+  'ContourLevels'   - 等高线数 (默认: 30, 推荐 20-50)
+  'Colormap'        - 颜色映射: 'hot'/'jet'/'cool'/'parula' 等
+  'ShowContourLines'- 显示等高线 (默认: false)
+  'Title'           - 图形标题
+  'FontSize'        - 字体大小
+  'LabelFontSize'   - 标签字体大小
+  'ParamLabel'      - 参数轴标签 (默认: 'Parameter (a.u.)')
+
+shg_power_fitting 参数：
+  'ModelType'       - 'power' (I=a×P^n) 或 'exponential' (I=a×exp(b×P))
+  'InitialGuess'    - 初始参数猜测 [a, b]
+  'Plot'            - 绘制拟合结果 (默认: false)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+❓ 常见问题
+═══════════════════════════════════════════════════════════════════════════════
+
+Q1: 数据组织有什么要求?
+A:  SHGData必须是结构体，包含:
+    - .data: (N×M) 矩阵，N为序列数(功率点数), M为波长点数
+    - .axisscale{1,1}: (N×1) 功率向量(mW)
+    - .axisscale{2,1}: (M×1) 波长向量(nm)
+
+Q2: 如何只绘制特定波长范围?
+A:  plot_shg_stack(SHGData, 'WavelengthRange', [600 700]);
+
+Q3: 如何调整堆叠曲线的间距?
+A:  plot_shg_stack(SHGData, 'Spacing', 0.2);  % 范围 0.05-0.3
+
+Q4: SHG功率拟合的幂指数应该是多少?
+A:  理想情况下应为 2.0 (真正的二次谐波)
+    实际值可能因非线性吸收等因素偏差
+    R² > 0.99 表示良好拟合
+
+Q5: 如何保存高质量图像?
+A:  print(gcf, 'figure.png', '-dpng', '-r300');  % 300 DPI
+    或: savefig(gcf, 'figure.fig');               % MATLAB格式
+
+Q6: 如何批量处理多个文件?
+A:  files = dir('*.mat');
+    for i = 1:length(files)
+        data = import_shg_data(files(i).name);
+        % 处理数据...
+    end
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🎓 推荐学习路径
+═══════════════════════════════════════════════════════════════════════════════
+
+初学者路线 (推荐 ~1小时)：
+  1. 运行 QUICKSTART.m                          (~10分钟)
+  2. 查看 examples/basic_plotting.m              (~20分钟)
+  3. 修改示例代码进行实验                         (~30分钟)
+
+进阶用户路线 (推荐 ~2小时)：
+  1. 学完初学者路线                               (~1小时)
+  2. 运行 examples/power_dependence.m             (~30分钟)
+  3. 编写自己的分析脚本                           (~30分钟)
+
+高级用户路线 (推荐 时间灵活)：
+  1. 深入研究各个函数的源代码
+  2. 根据需要修改和扩展函数
+  3. 集成自己的数据导入和处理流程
+
+═══════════════════════════════════════════════════════════════════════════════
+
+📞 技术支持
+═══════════════════════════════════════════════════════════════════════════════
+
+遇到问题？
+  1. 查看函数帮助：help plot_shg_stack
+  2. 参考 README.md 详细文档
+  3. 运行 examples 中的示例代码
+  4. 检查 SHGData 结构是否正确
+
+═══════════════════════════════════════════════════════════════════════════════
+
+版本信息
+  工具集版本: 1.0
+  创建日期: 2026-01-24
+  基于架构: PL-Analyzer v2.0
+  MATLAB要求: R2018b 或更高版本
+
+═══════════════════════════════════════════════════════════════════════════════
+
+祝你使用愉快！🎉
+
+下一步: 运行 QUICKSTART.m 或查看 examples/ 目录
