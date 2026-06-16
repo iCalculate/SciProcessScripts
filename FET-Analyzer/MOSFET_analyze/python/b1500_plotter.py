@@ -1,4 +1,4 @@
-"""B1500 Transfer / Output curve plotter — Nature-style, Qt (PySide6) GUI.
+"""MOSFET Data Plotter — Nature-style B1500 transfer/output curves, Qt (PySide6).
 
 Run::
 
@@ -612,10 +612,12 @@ class PlotterWindow(QtWidgets.QMainWindow):
         view_menu = mb.addMenu("&View")
         view_menu.addAction("Copy Image to Clipboard", self.copy_to_clipboard)
         view_menu.addAction("Reset Axes to Auto", self._reset_axes_auto)
-        self.lock_ratio_act = view_menu.addAction("Lock Preview Ratio")
+        # Parent the QAction to the window so its C++ object isn't collected.
+        self.lock_ratio_act = QtGui.QAction("Lock Preview Ratio", self)
         self.lock_ratio_act.setCheckable(True)
         self.lock_ratio_act.setChecked(True)
         self.lock_ratio_act.toggled.connect(self._toggle_lock_ratio)
+        view_menu.addAction(self.lock_ratio_act)
 
         help_menu = mb.addMenu("&Help")
         help_menu.addAction("About", self._show_about)
@@ -1097,6 +1099,7 @@ class PlotterWindow(QtWidgets.QMainWindow):
         if not self.measurement:
             return
         import io as _io
+        self._set_state("Copying…", busy=True)
         self._sync_cfg()
         buf = _io.BytesIO()
         old_size = self.fig.get_size_inches().copy()
@@ -1112,6 +1115,7 @@ class PlotterWindow(QtWidgets.QMainWindow):
             self.canvas.draw_idle()
         img = QtGui.QImage.fromData(buf.getvalue(), "PNG")
         QtWidgets.QApplication.clipboard().setImage(img)
+        self._set_state("Ready")
         self.statusBar().showMessage("Figure copied to clipboard", 2500)
 
     # ------------------------------------------------------------------ #
@@ -1140,6 +1144,7 @@ class PlotterWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(
                 self, "No data", f"No B1500 measurements found in:\n{source}")
             return
+        self._set_state("Loading…", busy=True)
         self.measurements = measurements
         self.meas_combo.blockSignals(True)
         self.meas_combo.clear()
@@ -1452,6 +1457,7 @@ class PlotterWindow(QtWidgets.QMainWindow):
             self, "Choose export folder")
         if not directory:
             return
+        self._set_state("Exporting…", busy=True)
         stem = os.path.splitext(os.path.basename(self.measurement.source_file))[0] \
             or "figure"
         self._sync_cfg()
@@ -1494,6 +1500,8 @@ class PlotterWindow(QtWidgets.QMainWindow):
                 json.dump(self._collect_config(), fh, indent=2, ensure_ascii=False)
             saved.append(p)
 
+        self._set_state("Ready")
+        self.statusBar().showMessage(f"Exported {len(saved)} file(s)", 3000)
         QtWidgets.QMessageBox.information(self, "Exported", "Saved:\n" + "\n".join(saved))
 
     def _processed_column(self, curve, name):
@@ -1544,6 +1552,8 @@ class PlotterWindow(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
     win = PlotterWindow()
     win.show()
     if len(sys.argv) > 1:

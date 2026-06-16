@@ -1,8 +1,11 @@
-# B1500 Nature-style Plotter (Python)
+# MOSFET Data Plotter (Python)
 
-A small GUI tool that turns Keysight **B1500A** CSV exports into
-publication-ready **Transfer** (Id–Vg) and **Output** (Id–Vd) curves following
-Nature figure conventions.
+A GUI tool that turns Keysight **B1500A** CSV exports into publication-ready
+**Transfer** (Id–Vg) and **Output** (Id–Vd) curves following Nature figure
+conventions. A menu bar (**File / View / Help**) and an always-on status bar
+(showing **Ready / Busy** plus the current measurement) sit around the plot;
+**File → Reset All Settings** restores every plot and preprocessing option to
+its defaults.
 
 ```
 python b1500_plotter.py                 # open the UI, then load data from inside
