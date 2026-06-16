@@ -1,12 +1,21 @@
-# FET Transfer Curve Analysis Scripts
+# FET Transfer / Output Curve Tools
 
-Folder notes:
+This directory holds two complementary toolsets for MOSFET / FET characterisation:
 
-- `FET_Analyzer_examples.m` is the runnable example entry point after the folder reorganization.
-- `FET_Analyzer.mlx` is kept as the original live script archive.
-- Sample CSV files now live in `B1500_data_export/` under this folder, so the MOSFET workflow is self-contained.
+| Folder | Language | Purpose |
+|--------|----------|---------|
+| **`matlab/`** | MATLAB | Parameter-extraction scripts (SS, Vth, Von, gm, …) from Id–Vg transfer curves. Documented in the sections below. |
+| **`python/`** | Python | A Nature-style GUI plotter for B1500A CSV exports (Transfer & Output curves), built to grow into analysis. See [`python/README.md`](python/README.md). |
+| `B1500_data_export/` | — | Raw instrument exports used for testing. **Git-ignored** (not version-controlled). |
 
-This directory contains MATLAB scripts that automatically extract FET device parameters from **Id–Vg (transfer) curves**. This document describes each script’s role, the expected data format, **how each parameter is extracted**, and the **mapping between variable names and their physical/mathematical meaning**.
+Quick start (plotter): `cd python && python b1500_plotter.py ../B1500_data_export`
+
+Folder notes (MATLAB):
+
+- `matlab/FET_Analyzer_examples.m` is the runnable example entry point.
+- `matlab/FET_Analyzer.mlx` is kept as the original live script archive.
+
+The MATLAB scripts automatically extract FET device parameters from **Id–Vg (transfer) curves**. The sections below describe each script’s role, the expected data format, **how each parameter is extracted**, and the **mapping between variable names and their physical/mathematical meaning**.
 
 ---
 

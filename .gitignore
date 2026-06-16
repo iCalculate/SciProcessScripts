@@ -1,0 +1,15 @@
+# Raw instrument data exports — large, machine-generated, not version-controlled
+B1500_data_export/
+**/B1500_data_export/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db

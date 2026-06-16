@@ -1,0 +1,8 @@
+# B1500 Nature-style plotter — runtime dependencies.
+numpy>=1.20
+matplotlib>=3.4
+scipy>=1.5        # Savitzky-Golay smoothing (a moving-average fallback is used if absent)
+# Qt GUI binding. PySide6 is recommended (matplotlib's Qt backend needs Qt>=5.10,
+# so an old Anaconda PyQt5/Qt5.9 will NOT work — install PySide6):
+#   pip install PySide6
+PySide6>=6.2   ; python_version >= "3.7"
