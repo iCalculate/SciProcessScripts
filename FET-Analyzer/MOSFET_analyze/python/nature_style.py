@@ -15,14 +15,33 @@ state into a user's other plots.
 
 from __future__ import annotations
 
+import math
 import os
+import warnings
 from dataclasses import dataclass, field
 from typing import List
 
 import matplotlib as mpl
+
+# matplotlib's mathtext can't render an arbitrary TTF (e.g. Graphik) and many such
+# fonts also lack the Unicode superscript block — so log-axis tick labels are
+# written as plain ASCII scientific notation, which every body font can render.
+warnings.filterwarnings("ignore", message="Glyph .* missing from current font")
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
-from matplotlib.ticker import LogLocator
+from matplotlib.ticker import Formatter, LogLocator
+
+class SciLogFormatter(Formatter):
+    """Label decade ticks as ``$10^{n}$`` via mathtext, rendered in the body font
+    (matplotlib >= 3.8 with a custom mathtext fontset)."""
+
+    def __call__(self, x, pos=None):
+        if x <= 0:
+            return ""
+        exp = math.log10(x)
+        if abs(exp - round(exp)) > 1e-6:   # only label exact decades
+            return ""
+        return rf"$10^{{{int(round(exp))}}}$"
 
 # Millimetre <-> inch helpers (Nature specifies widths in mm).
 MM = 1.0 / 25.4
@@ -198,9 +217,8 @@ def rc_context(cfg: StyleConfig) -> dict:
     """Return an rcParams dict to be used inside ``plt.rc_context``."""
     serif = cfg.font_family == "Times New Roman"
     stack = cfg.font_stack()
-    # Use the first family in the stack that is actually installed, so mathtext
-    # maps to the same concrete font as the body text (handles "Graphik" vs
-    # "Graphik-Regular" naming differences across machines).
+    # Resolve the first installed family in the stack so mathtext maps to the
+    # same concrete font as the body text (handles "Graphik" vs "Graphik-Regular").
     installed = {f.name for f in mpl.font_manager.fontManager.ttflist}
     primary = next((f for f in stack if f in installed), stack[0])
     rc = {
@@ -209,16 +227,17 @@ def rc_context(cfg: StyleConfig) -> dict:
         "font.family": "serif" if serif else "sans-serif",
         "font.weight": "normal",
         ("font.serif" if serif else "font.sans-serif"): stack,
-        # Render mathtext (axis labels like $V_\\mathrm{g}$) in the SAME font as
-        # the body text instead of matplotlib's default DejaVu math set.
+        # Render mathtext (subscripts/superscripts in labels & tick values) in the
+        # SAME font as the body text. matplotlib >= 3.8 honours a custom TTF here.
         "mathtext.fontset": "custom",
-        "mathtext.default": "rm",
         "mathtext.rm": primary,
         "mathtext.it": primary,
         "mathtext.bf": primary,
         "mathtext.sf": primary,
         "mathtext.cal": primary,
         "mathtext.tt": primary,
+        "mathtext.default": "regular",
+        "axes.unicode_minus": False,   # ASCII '-' (some TTFs lack U+2212)
         "font.size": cfg.font_size,
         "axes.titlesize": cfg.font_size,
         "axes.labelsize": cfg.label_size,
@@ -287,9 +306,12 @@ def style_axes(ax: Axes, cfg: StyleConfig, *, log_y: bool = False,
                        length=cfg.tick_length * scale, width=w, **ytick)
         ax.tick_params(axis="x", which=which, direction="in",
                        length=cfg.tick_length * scale, width=w, **xtick)
-    if cfg.minor_ticks and log_y:
-        ax.yaxis.set_minor_locator(
-            LogLocator(base=10.0, subs=tuple(range(2, 10)), numticks=100))
+    if log_y:
+        # Plain ASCII decade labels, so the body font renders them.
+        ax.yaxis.set_major_formatter(SciLogFormatter())
+        if cfg.minor_ticks:
+            ax.yaxis.set_minor_locator(
+                LogLocator(base=10.0, subs=tuple(range(2, 10)), numticks=100))
 
 
 def add_panel_label(ax, label: str, x: float = -0.16, y: float = 1.02,

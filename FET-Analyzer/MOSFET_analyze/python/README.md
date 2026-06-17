@@ -2,24 +2,53 @@
 
 A GUI tool that turns Keysight **B1500A** CSV exports into publication-ready
 **Transfer** (Id–Vg) and **Output** (Id–Vd) curves following Nature figure
-conventions. A menu bar (**File / View / Help**) and an always-on status bar
-(showing **Ready / Busy** plus the current measurement) sit around the plot;
-**File → Reset All Settings** restores every plot and preprocessing option to
-its defaults.
+conventions. A menu bar (**File / Edit / View / Help**) and an always-on status bar
+(showing **Ready / Busy** plus the current measurement) sit around the plot.
+Switching the data source in the **Data** dropdown **keeps your current
+settings** (axis ranges, labels, scaling, smoothing …) — only the curve list
+follows the data. Use the **Reset** button (next to *Apply / Replot*) or
+**File → Reset All Settings** to return everything to defaults (axes back to
+Auto).
+
+**Edit → Preferences** sets the default style, grouped into Typography (font,
+size), Figure (width, height, DPI), Lines & frame (line / tick / border width,
+tick length, full-box, minor ticks) and Colours (default mode, ramp, and the
+editable categorical **palette swatches**). Font, palette, tick length and
+minor-ticks apply immediately; the other numeric defaults take effect on Reset.
+Preferences persist across sessions in `preferences.json`.
 
 ```
-python b1500_plotter.py                 # open the UI, then load data from inside
-python b1500_plotter.py <file.csv>      # preload one file
-python b1500_plotter.py <folder>        # preload every B1500 CSV in a folder
+run.bat                                 # Windows: launches in the uv env
+run.bat <file.csv | folder>            # preload a file or folder
 ```
 
-Dependencies: `numpy`, `matplotlib`, and **`PySide6`** (the Qt GUI). See
-`requirements.txt`. PySide6 is required because matplotlib's Qt backend needs
-Qt ≥ 5.10 — an old Anaconda `PyQt5`/Qt 5.9 will not work; install PySide6 with
-`pip install PySide6`. The app auto-selects an available Qt binding (PySide6 →
-PyQt6 → …) and pins Qt's plugin path to it, which avoids the
-"no Qt platform plugin could be initialized" error when multiple Qt bindings
-coexist in one environment.
+or directly with [uv](https://docs.astral.sh/uv/):
+
+```
+uv run python b1500_plotter.py [<file.csv> | <folder>]
+```
+
+### Environment (uv-managed, self-contained)
+
+The project carries its **own isolated environment**, managed by `uv` and pinned
+in `pyproject.toml` + `uv.lock` (Python 3.11, `matplotlib`, `PySide6`, `numpy`,
+`scipy`). It does **not** use any system / conda Python. `uv run` (and `run.bat`)
+create/update `.venv` automatically from the lockfile on first launch — nothing
+to install by hand.
+
+Python ≥ 3.11 with matplotlib ≥ 3.8 is required so that **mathtext labels render
+in the Graphik font** (older matplotlib cannot use an arbitrary TTF for math, so
+`$V_\mathrm{g}$` / `$10^{-9}$` would fall back to a different font).
+
+Common commands (run inside this folder):
+
+```
+uv sync            # create/refresh the environment from the lockfile
+uv add <pkg>       # add a dependency (updates pyproject.toml + uv.lock)
+uv run python ...  # run anything inside the project environment
+```
+
+`pyproject.toml` and `uv.lock` are version-controlled; `.venv/` is git-ignored.
 
 ---
 
@@ -31,7 +60,7 @@ The control panel is organised into three tabs.
 
 | Section   | Controls |
 |-----------|----------|
-| **Figure**| Width / height (inches = export size & aspect), font, font size, **line width**, **tick width** (edge tick thickness), DPI; Nature presets; full-box vs open-spine frame; lock-preview-ratio. The preview shows the figure (white) on a dark-grey page margin so the figure edge is obvious. |
+| **Figure**| Width / height (inches = export size & aspect), font size, **line width**, **tick width**, **border width** (spine thickness), DPI; Nature presets; full-box vs open-spine frame. The preview is **true WYSIWYG**: the figure is rendered at its fixed W×H and scaled uniformly to fit, so fonts/lines keep the exact same proportion at any window size and match the Copy/Export output. The font family is set in **Edit → Preferences**, not here. |
 | **Title** | Collapsible. Optional plot title. |
 | **Axes**  | Collapsible. X / left-Y labels, ranges (min/max boxes always present; when on auto they display the live autoscaled value in grey — overwrite to override), linear/log, `abs()`. **Id + |Ig|**: overlay the gate current on the **same axis**, or on a **right axis whose numeric range is locked equal to the left** axis. With an open frame the top edge line is never drawn, even with the second axis. |
 | **Curves**| **Colour strategy** (sequential ramp vs categorical); per-curve show/hide, colour picker, editable label; legend or **colourbar**. |
@@ -64,10 +93,12 @@ Refines the same plot without changing any Plot-tab styling:
   **g\_m,max** line. Text labels are shown when ≤ 3 curves are visible to avoid
   clutter on stepped families.
 
-Default style: **Graphik** font, 3 × 4 in, 16 pt, line width 2, DPI 300. The
-Graphik weights are bundled in `fonts/` and registered at startup (and mapped
-into mathtext, so axis labels like `$V_\mathrm{g}$` use Graphik too, not the
-matplotlib default). Drop other `.ttf`/`.otf` files into `fonts/` to add them.
+Default style: **Graphik** font, 3 × 4 in, 16 pt, line width 2, DPI 300.
+`Graphik-Regular.ttf` is bundled in `fonts/` and registered at startup; a custom
+mathtext fontset maps math to it, so axis titles and tick values render in
+Graphik **with proper subscripts/superscripts** (`$V_\mathrm{g}$`, `$|I_\mathrm{d}|$`,
+`$10^{-9}$`) — real labels, not text overlays. (This needs matplotlib ≥ 3.8; see
+**Environment** above.) Drop other `.ttf`/`.otf` files into `fonts/` to add choices.
 
 **Copy image** puts the figure (rendered at the export geometry) straight on the
 clipboard.

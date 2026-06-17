@@ -78,8 +78,7 @@ _QT_MODULE = _select_qt_binding()
 
 import matplotlib  # noqa: E402
 matplotlib.use("QtAgg")
-from matplotlib.backends.backend_qtagg import (  # noqa: E402
-    FigureCanvasQTAgg, NavigationToolbar2QT)
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 
 from PySide6 import QtCore, QtGui, QtWidgets  # noqa: E402
@@ -94,19 +93,25 @@ CURRENT_COLUMNS_PREF = ["Id", "absId", "Ig", "absIg", "Is", "Jd", "gm"]
 APP_NAME = "MOSFET Data Plotter"
 APP_VERSION = "1.0"
 
+# On-screen preview render resolution. Proportions are identical at any DPI;
+# this only sets the base crispness before the image is scaled to the window.
+PREVIEW_DPI = 200
+
 
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
 
 def pretty_axis_label(col: str) -> str:
+    # mathtext subscripts; rendered in the body font via the custom mathtext
+    # fontset (matplotlib >= 3.8).
     table = {
         "Vg": r"$V_\mathrm{g}$ (V)", "Vd": r"$V_\mathrm{d}$ (V)",
         "Vs": r"$V_\mathrm{s}$ (V)", "Vds": r"$V_\mathrm{ds}$ (V)",
         "Id": r"$I_\mathrm{d}$ (A)", "absId": r"$|I_\mathrm{d}|$ (A)",
         "Ig": r"$I_\mathrm{g}$ (A)", "absIg": r"$|I_\mathrm{g}|$ (A)",
         "Is": r"$I_\mathrm{s}$ (A)", "gm": r"$g_\mathrm{m}$ (S)",
-        "Jd": r"$J_\mathrm{d}$ (A mm$^{-1}$)",
+        "Jd": r"$J_\mathrm{d}$ (A/mm)",
     }
     return table.get(col, col)
 
@@ -173,7 +178,7 @@ class RangeEdit(QtWidgets.QLineEdit):
         super().__init__()
         self.auto = True
         self._on_change = on_change
-        self.setFixedWidth(78)
+        self.setFixedWidth(66)
         self.textEdited.connect(self._user_edited)
         self.editingFinished.connect(self._finished)
         self._restyle()
@@ -189,7 +194,9 @@ class RangeEdit(QtWidgets.QLineEdit):
         self._on_change()
 
     def _restyle(self):
-        self.setStyleSheet("color:#999;" if self.auto else "color:black;")
+        # Muted grey for auto (visible on light & dark themes); empty stylesheet
+        # for manual so it inherits the theme's normal text colour.
+        self.setStyleSheet("color:#8a8a8a;" if self.auto else "")
 
     def show_auto_value(self, value: float):
         """If in auto mode, display the current autoscaled limit (grey)."""
@@ -219,14 +226,18 @@ class SmoothControls(QtWidgets.QWidget):
         grid.addWidget(QtWidgets.QLabel("Method"), 1, 0)
         self.method = QtWidgets.QComboBox()
         self.method.addItems(pp.SMOOTH_METHODS)
+        self.method.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.method.setMinimumContentsLength(10)
         self.method.currentIndexChanged.connect(self._changed)
         grid.addWidget(self.method, 1, 1)
 
-        grid.addWidget(QtWidgets.QLabel("Window (pts)"), 2, 0)
+        grid.addWidget(QtWidgets.QLabel("Window"), 2, 0)
         self.window = QtWidgets.QSpinBox()
         self.window.setRange(3, 201)
         self.window.setSingleStep(2)
         self.window.setValue(7)
+        self.window.setMinimumWidth(78)
         self.window.valueChanged.connect(self._changed)
         grid.addWidget(self.window, 2, 1)
 
@@ -235,29 +246,36 @@ class SmoothControls(QtWidgets.QWidget):
         self.poly = QtWidgets.QSpinBox()
         self.poly.setRange(1, 6)
         self.poly.setValue(2)
+        self.poly.setMinimumWidth(78)
         self.poly.valueChanged.connect(self._changed)
         grid.addWidget(self.poly, 3, 1)
 
-        self.sigma_label = QtWidgets.QLabel("Sigma (pts)")
+        self.sigma_label = QtWidgets.QLabel("Sigma")
         grid.addWidget(self.sigma_label, 4, 0)
         self.sigma = QtWidgets.QDoubleSpinBox()
         self.sigma.setRange(0.3, 50)
         self.sigma.setSingleStep(0.5)
         self.sigma.setValue(2.0)
+        self.sigma.setMinimumWidth(78)
         self.sigma.valueChanged.connect(self._changed)
         grid.addWidget(self.sigma, 4, 1)
+        grid.setColumnStretch(1, 0)
+        for s in (self.window, self.poly, self.sigma):
+            s.setMaximumWidth(90)
 
         self.strength = QtWidgets.QLabel()
         self.strength.setStyleSheet("color:#666;")
         grid.addWidget(self.strength, 5, 0, 1, 2)
 
         # --- Optional noise floor, applied AFTER smoothing ---
-        self.noise_enable = QtWidgets.QCheckBox("Add noise floor (after smoothing)")
+        self.noise_enable = QtWidgets.QCheckBox("Add noise floor")
+        self.noise_enable.setToolTip("Add a noise floor after smoothing")
         self.noise_enable.toggled.connect(self._changed)
         grid.addWidget(self.noise_enable, 6, 0, 1, 2)
-        self.noise_level_label = QtWidgets.QLabel("Level (A, RMS)")
+        self.noise_level_label = QtWidgets.QLabel("Level (A)")
         grid.addWidget(self.noise_level_label, 7, 0)
         self.noise_level = QtWidgets.QLineEdit("1e-12")
+        self.noise_level.setFixedWidth(80)
         self.noise_level.editingFinished.connect(self._changed)
         grid.addWidget(self.noise_level, 7, 1)
         self.noise_seed_label = QtWidgets.QLabel("Seed")
@@ -399,47 +417,38 @@ class CurveRow:
         return self.edit.text()
 
 
-class AspectCanvas(QtWidgets.QWidget):
-    """Hosts the matplotlib canvas and (optionally) letterboxes it to a ratio."""
+class PreviewLabel(QtWidgets.QLabel):
+    """True-WYSIWYG preview: shows the figure rendered at its fixed W×H size,
+    scaled *uniformly* to fit the area.
 
-    def __init__(self, canvas: FigureCanvasQTAgg):
+    Because the whole rendered image is scaled as one unit, every element —
+    fonts, line widths, spacing — keeps the exact same proportion no matter how
+    the window is resized, and matches the Copy Image / Export output.
+    """
+
+    def __init__(self):
         super().__init__()
-        self._canvas = canvas
-        canvas.setParent(self)
-        self._ratio = 1.0
-        self._lock = True
-        # Dark-grey margins around a white figure so the page edge is obvious.
+        self.setAlignment(QtCore.Qt.AlignCenter)
+        self.setMinimumSize(80, 80)
         self.setAutoFillBackground(True)
         pal = self.palette()
         pal.setColor(QtGui.QPalette.Window, QtGui.QColor("#3a3a3a"))
         self.setPalette(pal)
+        self._pix = None
 
-    def set_ratio(self, ratio: float):
-        self._ratio = max(ratio, 0.05)
-        self._relayout()
-
-    def set_lock(self, lock: bool):
-        self._lock = lock
-        self._relayout()
+    def set_figure_pixmap(self, pix: "QtGui.QPixmap"):
+        self._pix = pix
+        self._rescale()
 
     def resizeEvent(self, event):
-        self._relayout()
+        self._rescale()
         super().resizeEvent(event)
 
-    def _relayout(self):
-        W, H = self.width(), self.height()
-        if W < 10 or H < 10:
+    def _rescale(self):
+        if self._pix is None or self._pix.isNull():
             return
-        if not self._lock:
-            self._canvas.setGeometry(0, 0, W, H)
-            return
-        w = W
-        h = w / self._ratio
-        if h > H:
-            h = H
-            w = h * self._ratio
-        x, y = (W - w) / 2, (H - h) / 2
-        self._canvas.setGeometry(int(x), int(y), int(max(w, 10)), int(max(h, 10)))
+        super().setPixmap(self._pix.scaled(
+            self.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
 
 
 class ExportDialog(QtWidgets.QDialog):
@@ -494,6 +503,150 @@ class ExportDialog(QtWidgets.QDialog):
                 "csv": self.csv_chk.isChecked(), "json": self.json_chk.isChecked()}
 
 
+class PreferencesDialog(QtWidgets.QDialog):
+    """Grouped editor for the default style parameters (typography, figure,
+    lines/frame, colours)."""
+
+    def __init__(self, parent, prefs: "ns.StyleConfig"):
+        super().__init__(parent)
+        self.setWindowTitle("Preferences")
+        self.resize(420, 620)
+        outer = QtWidgets.QVBoxLayout(self)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        body = QtWidgets.QWidget()
+        scroll.setWidget(body)
+        v = QtWidgets.QVBoxLayout(body)
+        outer.addWidget(scroll, 1)
+
+        def group(title):
+            g = QtWidgets.QGroupBox(title)
+            v.addWidget(g)
+            return QtWidgets.QFormLayout(g)
+
+        def dspin(lo, hi, step, val, decimals=2):
+            s = QtWidgets.QDoubleSpinBox()
+            s.setRange(lo, hi)
+            s.setSingleStep(step)
+            s.setDecimals(decimals)
+            s.setValue(val)
+            s.setMinimumWidth(90)
+            return s
+
+        # --- Typography ---
+        t = group("Typography")
+        self.font_combo = QtWidgets.QComboBox()
+        fonts = ns.get_available_fonts()
+        self.font_combo.addItems(fonts)
+        if prefs.font_family in fonts:
+            self.font_combo.setCurrentText(prefs.font_family)
+        t.addRow("Font", self.font_combo)
+        self.fontsize_spin = dspin(4, 40, 0.5, prefs.font_size)
+        t.addRow("Font size", self.fontsize_spin)
+
+        # --- Figure size ---
+        f = group("Figure")
+        self.width_spin = dspin(1.0, 20, 0.1, prefs.width_in)
+        self.height_spin = dspin(1.0, 20, 0.1, prefs.height_in)
+        self.dpi_spin = QtWidgets.QSpinBox()
+        self.dpi_spin.setRange(50, 1200)
+        self.dpi_spin.setSingleStep(50)
+        self.dpi_spin.setValue(prefs.dpi)
+        self.dpi_spin.setMinimumWidth(90)
+        f.addRow("Width (in)", self.width_spin)
+        f.addRow("Height (in)", self.height_spin)
+        f.addRow("DPI", self.dpi_spin)
+
+        # --- Lines & frame ---
+        lf = group("Lines & frame")
+        self.linewidth_spin = dspin(0.3, 6, 0.1, prefs.line_width)
+        self.tickwidth_spin = dspin(0.3, 6, 0.1, prefs.tick_width)
+        self.borderwidth_spin = dspin(0.3, 6, 0.1, prefs.axes_line_width)
+        self.ticklen_spin = dspin(0, 12, 0.5, prefs.tick_length)
+        lf.addRow("Line width", self.linewidth_spin)
+        lf.addRow("Tick width", self.tickwidth_spin)
+        lf.addRow("Border width", self.borderwidth_spin)
+        lf.addRow("Tick length", self.ticklen_spin)
+        self.fullbox_chk = QtWidgets.QCheckBox("Full box (4 spines)")
+        self.fullbox_chk.setChecked(prefs.full_box)
+        lf.addRow(self.fullbox_chk)
+        self.minor_chk = QtWidgets.QCheckBox("Minor ticks")
+        self.minor_chk.setChecked(prefs.minor_ticks)
+        lf.addRow(self.minor_chk)
+
+        # --- Colours ---
+        cg = group("Colours")
+        self.colormode_combo = QtWidgets.QComboBox()
+        self.colormode_combo.addItems(["sequential", "categorical"])
+        self.colormode_combo.setCurrentText(prefs.color_mode)
+        cg.addRow("Default mode", self.colormode_combo)
+        self.ramp_combo = QtWidgets.QComboBox()
+        self.ramp_combo.addItems(list(ns.SEQUENTIAL_RAMPS.keys()))
+        self.ramp_combo.setCurrentText(prefs.ramp)
+        cg.addRow("Default ramp", self.ramp_combo)
+
+        self._palette = list(prefs.palette)
+        self._swatches = []
+        sw_row = QtWidgets.QHBoxLayout()
+        sw_row.setSpacing(4)
+        for i, col in enumerate(self._palette):
+            b = QtWidgets.QPushButton()
+            b.setFixedSize(26, 22)
+            b.setStyleSheet(f"background:{col}; border:1px solid #888;")
+            b.clicked.connect(lambda _=False, idx=i: self._pick_palette(idx))
+            self._swatches.append(b)
+            sw_row.addWidget(b)
+        sw_row.addStretch(1)
+        cg.addRow("Categorical", self._wrap(sw_row))
+
+        note = QtWidgets.QLabel(
+            "Font, palette, tick length and minor-ticks apply immediately; the "
+            "other numeric defaults take effect on Reset / next launch. Saved "
+            "across sessions.")
+        note.setStyleSheet("color:#888;")
+        note.setWordWrap(True)
+        v.addWidget(note)
+        v.addStretch(1)
+
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        outer.addWidget(bb)
+
+    @staticmethod
+    def _wrap(layout):
+        w = QtWidgets.QWidget()
+        w.setLayout(layout)
+        return w
+
+    def _pick_palette(self, idx):
+        col = QtWidgets.QColorDialog.getColor(
+            QtGui.QColor(self._palette[idx]), self, "Palette colour")
+        if col.isValid():
+            self._palette[idx] = col.name()
+            self._swatches[idx].setStyleSheet(
+                f"background:{col.name()}; border:1px solid #888;")
+
+    def updated_prefs(self, base: "ns.StyleConfig") -> "ns.StyleConfig":
+        import dataclasses
+        return dataclasses.replace(
+            base, font_family=self.font_combo.currentText(),
+            width_in=self.width_spin.value(), height_in=self.height_spin.value(),
+            font_size=self.fontsize_spin.value(),
+            line_width=self.linewidth_spin.value(),
+            tick_width=self.tickwidth_spin.value(),
+            axes_line_width=self.borderwidth_spin.value(),
+            tick_length=self.ticklen_spin.value(),
+            full_box=self.fullbox_chk.isChecked(),
+            minor_ticks=self.minor_chk.isChecked(),
+            color_mode=self.colormode_combo.currentText(),
+            ramp=self.ramp_combo.currentText(),
+            dpi=int(self.dpi_spin.value()),
+            palette=list(self._palette))
+
+
 # --------------------------------------------------------------------------- #
 # Main window
 # --------------------------------------------------------------------------- #
@@ -504,7 +657,10 @@ class PlotterWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.resize(1360, 900)
 
-        self.cfg = ns.StyleConfig()
+        # Preferred defaults (Edit → Preferences), persisted across sessions.
+        self.prefs = self._load_preferences()
+        import dataclasses
+        self.cfg = dataclasses.replace(self.prefs)
         self.pre = pp.PreprocessConfig()
         self.measurements: List[io.Measurement] = []
         self.measurement: Optional[io.Measurement] = None
@@ -533,7 +689,7 @@ class PlotterWindow(QtWidgets.QMainWindow):
 
         # ---- Left: Data (always visible) + Tabs + Actions ----
         left = QtWidgets.QWidget()
-        left.setFixedWidth(410)
+        left.setFixedWidth(470)
         left_lay = QtWidgets.QVBoxLayout(left)
         left_lay.setContentsMargins(6, 6, 6, 6)
         self._build_data_section(left_lay)
@@ -559,24 +715,26 @@ class PlotterWindow(QtWidgets.QMainWindow):
         self._build_actions(left_lay)
         root.addWidget(left)
 
-        # ---- Right: plot + toolbar ----
+        # ---- Right: fixed-proportion WYSIWYG preview ----
         right = QtWidgets.QWidget()
         rlay = QtWidgets.QVBoxLayout(right)
         rlay.setContentsMargins(4, 4, 4, 4)
+        # The Figure stays at the chosen export size; the canvas is used purely
+        # as an off-screen Agg renderer, and the result is shown scaled in the
+        # preview label (so proportions never change with the window).
         self.fig = Figure(figsize=(self.cfg.width_in, self.cfg.height_in),
                           constrained_layout=True, facecolor="white")
         self.canvas = FigureCanvasQTAgg(self.fig)
-        self.aspect = AspectCanvas(self.canvas)
-        self.aspect.set_ratio(self.cfg.width_in / self.cfg.height_in)
-        toolbar = NavigationToolbar2QT(self.canvas, self)
-        rlay.addWidget(self.aspect, 1)
-        rlay.addWidget(toolbar, 0)
+        self.preview = PreviewLabel()
+        rlay.addWidget(self.preview, 1)
         root.addWidget(right, 1)
 
     def _make_tab(self, name: str) -> QtWidgets.QVBoxLayout:
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        # Never overflow horizontally — keep everything within the panel width.
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         content = QtWidgets.QWidget()
         scroll.setWidget(content)
         lay = QtWidgets.QVBoxLayout(content)
@@ -609,15 +767,13 @@ class PlotterWindow(QtWidgets.QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction("Exit", self.close)
 
+        edit_menu = mb.addMenu("&Edit")
+        edit_menu.addAction("Preferences…", self._open_preferences)
+        edit_menu.addAction("Reset All Settings", self._reset_settings)
+
         view_menu = mb.addMenu("&View")
         view_menu.addAction("Copy Image to Clipboard", self.copy_to_clipboard)
         view_menu.addAction("Reset Axes to Auto", self._reset_axes_auto)
-        # Parent the QAction to the window so its C++ object isn't collected.
-        self.lock_ratio_act = QtGui.QAction("Lock Preview Ratio", self)
-        self.lock_ratio_act.setCheckable(True)
-        self.lock_ratio_act.setChecked(True)
-        self.lock_ratio_act.toggled.connect(self._toggle_lock_ratio)
-        view_menu.addAction(self.lock_ratio_act)
 
         help_menu = mb.addMenu("&Help")
         help_menu.addAction("About", self._show_about)
@@ -639,19 +795,19 @@ class PlotterWindow(QtWidgets.QMainWindow):
         self.status_state.repaint()   # show immediately, even mid-operation
 
     def _reset_settings(self):
-        """Restore every plot and preprocessing setting to its default."""
+        """Restore every plot and preprocessing setting to the preferred defaults."""
+        import dataclasses
         self._set_state("Resetting…", busy=True)
-        self.cfg = ns.StyleConfig()
+        c = dataclasses.replace(self.prefs)   # defaults from Edit → Preferences
+        self.cfg = c
         self.pre = pp.PreprocessConfig()
-        c = self.cfg
         widgets = [self.width_spin, self.height_spin, self.fontsize_spin,
-                   self.linewidth_spin, self.tickwidth_spin, self.dpi_spin,
-                   self.font_combo, self.fullbox_chk, self.lockaspect_chk,
-                   self.colormode_combo, self.ramp_combo, self.legend_chk,
-                   self.colorbar_chk, self.title_edit, self.show_ig_chk,
-                   self.ig_axis_combo, self.idscale_spin, self.igscale_spin,
-                   self.ann_ss_chk, self.ann_onoff_chk, self.ann_vth_chk,
-                   self.ann_gm_chk]
+                   self.linewidth_spin, self.tickwidth_spin, self.borderwidth_spin,
+                   self.dpi_spin, self.fullbox_chk, self.colormode_combo,
+                   self.ramp_combo, self.legend_chk, self.colorbar_chk,
+                   self.title_edit, self.show_ig_chk, self.ig_axis_combo,
+                   self.idscale_spin, self.igscale_spin, self.ann_ss_chk,
+                   self.ann_onoff_chk, self.ann_vth_chk, self.ann_gm_chk]
         for w in widgets:
             w.blockSignals(True)
         self.width_spin.setValue(c.width_in)
@@ -659,11 +815,9 @@ class PlotterWindow(QtWidgets.QMainWindow):
         self.fontsize_spin.setValue(c.font_size)
         self.linewidth_spin.setValue(c.line_width)
         self.tickwidth_spin.setValue(c.tick_width)
+        self.borderwidth_spin.setValue(c.axes_line_width)
         self.dpi_spin.setValue(c.dpi)
-        if c.font_family in ns.get_available_fonts():
-            self.font_combo.setCurrentText(c.font_family)
         self.fullbox_chk.setChecked(c.full_box)
-        self.lockaspect_chk.setChecked(True)
         self.colormode_combo.setCurrentText(c.color_mode)
         self.ramp_combo.setCurrentText(c.ramp)
         self.legend_chk.setChecked(True)
@@ -680,20 +834,13 @@ class PlotterWindow(QtWidgets.QMainWindow):
             w.blockSignals(False)
         self.id_smooth_ctrl.reset()
         self.ig_smooth_ctrl.reset()
-        self.aspect.set_lock(True)
-        self.aspect.set_ratio(c.width_in / c.height_in)
-        if hasattr(self, "lock_ratio_act"):
-            self.lock_ratio_act.setChecked(True)
-        # Re-apply per-measurement defaults (axis labels, columns, curve rows).
+        # Re-apply per-measurement defaults (axis labels, columns, ranges→auto).
         if self.measurement:
-            self._on_measurement_selected()
+            self._load_measurement(apply_defaults=True)
         else:
             self._refresh_plot()
         self._set_state("Ready")
         self.statusBar().showMessage("All settings reset to defaults", 3000)
-
-    def _toggle_lock_ratio(self, on: bool):
-        self.lockaspect_chk.setChecked(on)  # keeps the panel checkbox in sync
 
     def _reset_axes_auto(self):
         for e in (self.xmin_edit, self.xmax_edit, self.ymin_edit, self.ymax_edit):
@@ -709,6 +856,55 @@ class PlotterWindow(QtWidgets.QMainWindow):
             f"<b>{APP_NAME}</b> v{APP_VERSION}<br><br>"
             "Nature-style plotting and analysis for Keysight B1500A "
             "transfer / output curves.")
+
+    # ---- Preferences (defaults) --------------------------------------- #
+    _PREF_KEYS = ("font_family", "width_in", "height_in", "font_size",
+                  "line_width", "tick_width", "axes_line_width", "tick_length",
+                  "dpi", "full_box", "minor_ticks", "color_mode", "ramp",
+                  "palette")
+
+    def _pref_path(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "preferences.json")
+
+    def _load_preferences(self) -> "ns.StyleConfig":
+        cfg = ns.StyleConfig()
+        try:
+            import json
+            with open(self._pref_path(), encoding="utf-8") as fh:
+                data = json.load(fh)
+            for k in self._PREF_KEYS:
+                if k in data:
+                    setattr(cfg, k, data[k])
+        except (OSError, ValueError):
+            pass
+        return cfg
+
+    def _save_preferences(self):
+        import json
+        data = {k: getattr(self.prefs, k) for k in self._PREF_KEYS}
+        try:
+            with open(self._pref_path(), "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+        except OSError:
+            pass
+
+    def _open_preferences(self):
+        dlg = PreferencesDialog(self, self.prefs)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        self.prefs = dlg.updated_prefs(self.prefs)
+        self._save_preferences()
+        # Apply the styles that have no per-figure control immediately; the rest
+        # are defaults that take effect on Reset.
+        self.cfg.font_family = self.prefs.font_family
+        self.cfg.palette = list(self.prefs.palette)
+        self.cfg.tick_length = self.prefs.tick_length
+        self.cfg.minor_ticks = self.prefs.minor_ticks
+        if self.rows:
+            self._assign_curve_colors()   # repaint swatches with the new palette
+        self._refresh_plot()
+        self.statusBar().showMessage("Preferences saved", 3000)
 
     # ---- Data ---------------------------------------------------------- #
     def _build_data_section(self, parent):
@@ -740,59 +936,60 @@ class PlotterWindow(QtWidgets.QMainWindow):
         self.fontsize_spin = self._dspin(4, 40, 0.5, self.cfg.font_size)
         self.linewidth_spin = self._dspin(0.3, 6, 0.1, self.cfg.line_width)
         self.tickwidth_spin = self._dspin(0.3, 6, 0.1, self.cfg.tick_width)
+        self.borderwidth_spin = self._dspin(0.3, 6, 0.1, self.cfg.axes_line_width)
         self.dpi_spin = QtWidgets.QSpinBox()
         self.dpi_spin.setRange(50, 1200)
         self.dpi_spin.setSingleStep(50)
         self.dpi_spin.setValue(self.cfg.dpi)
+        self.dpi_spin.setMinimumWidth(78)
         self.dpi_spin.valueChanged.connect(self._schedule)
         for spin in (self.width_spin, self.height_spin):
             spin.valueChanged.connect(self._on_size_changed)
-        for spin in (self.fontsize_spin, self.linewidth_spin, self.tickwidth_spin):
+        for spin in (self.fontsize_spin, self.linewidth_spin, self.tickwidth_spin,
+                     self.borderwidth_spin):
             spin.valueChanged.connect(self._schedule)
 
-        grid.addWidget(QtWidgets.QLabel("Width (in)"), 0, 0)
-        grid.addWidget(self.width_spin, 0, 1)
-        grid.addWidget(QtWidgets.QLabel("Height (in)"), 0, 2)
-        grid.addWidget(self.height_spin, 0, 3)
-        grid.addWidget(QtWidgets.QLabel("Font size"), 1, 0)
-        grid.addWidget(self.fontsize_spin, 1, 1)
-        grid.addWidget(QtWidgets.QLabel("Line width"), 1, 2)
-        grid.addWidget(self.linewidth_spin, 1, 3)
-        grid.addWidget(QtWidgets.QLabel("Tick width"), 2, 0)
-        grid.addWidget(self.tickwidth_spin, 2, 1)
-        grid.addWidget(QtWidgets.QLabel("DPI"), 2, 2)
-        grid.addWidget(self.dpi_spin, 2, 3)
-        grid.addWidget(QtWidgets.QLabel("Font"), 3, 0)
-        self.font_combo = QtWidgets.QComboBox()
-        fonts = ns.get_available_fonts()
-        self.font_combo.addItems(fonts)
-        if self.cfg.font_family in fonts:
-            self.font_combo.setCurrentText(self.cfg.font_family)
-        self.font_combo.currentIndexChanged.connect(self._schedule)
-        grid.addWidget(self.font_combo, 3, 1, 1, 3)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+
+        def cell(text, widget, r, c):
+            lab = QtWidgets.QLabel(text)
+            lab.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            grid.addWidget(lab, r, c * 2)
+            grid.addWidget(widget, r, c * 2 + 1)
+
+        cell("Width", self.width_spin, 0, 0)
+        cell("Height", self.height_spin, 0, 1)
+        cell("Font", self.fontsize_spin, 1, 0)
+        cell("Line", self.linewidth_spin, 1, 1)
+        cell("Tick", self.tickwidth_spin, 2, 0)
+        cell("Border", self.borderwidth_spin, 2, 1)
+        cell("DPI", self.dpi_spin, 3, 0)
+        # Spin columns share the slack so values fill the panel neatly.
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
 
         presets = QtWidgets.QHBoxLayout()
         presets.addWidget(QtWidgets.QLabel("Preset:"))
-        p1 = QtWidgets.QPushButton("Single (89 mm)")
+        p1 = QtWidgets.QPushButton("89 mm")
+        p1.setToolTip("Nature single column (89 mm)")
         p1.clicked.connect(lambda: self._set_size(ns.SINGLE_COLUMN_IN,
                                                   ns.SINGLE_COLUMN_IN * 0.8))
-        p2 = QtWidgets.QPushButton("Double (183 mm)")
+        p2 = QtWidgets.QPushButton("183 mm")
+        p2.setToolTip("Nature double column (183 mm)")
         p2.clicked.connect(lambda: self._set_size(ns.DOUBLE_COLUMN_IN,
                                                  ns.DOUBLE_COLUMN_IN * 0.62))
         presets.addWidget(p1)
         presets.addWidget(p2)
+        presets.addStretch(1)
         lay.addLayout(presets)
 
         row = QtWidgets.QHBoxLayout()
-        self.fullbox_chk = QtWidgets.QCheckBox("Full box (4 spines)")
+        self.fullbox_chk = QtWidgets.QCheckBox("Full box")
+        self.fullbox_chk.setToolTip("Draw all four axis spines")
         self.fullbox_chk.setChecked(self.cfg.full_box)
         self.fullbox_chk.toggled.connect(self._schedule)
-        self.lockaspect_chk = QtWidgets.QCheckBox("Lock preview ratio")
-        self.lockaspect_chk.setChecked(True)
-        self.lockaspect_chk.toggled.connect(
-            lambda v: (self.aspect.set_lock(v), self._schedule()))
         row.addWidget(self.fullbox_chk)
-        row.addWidget(self.lockaspect_chk)
         row.addStretch(1)
         lay.addLayout(row)
 
@@ -802,10 +999,11 @@ class PlotterWindow(QtWidgets.QMainWindow):
         s.setSingleStep(step)
         s.setDecimals(2)
         s.setValue(val)
+        s.setMinimumWidth(78)
         return s
 
     def _on_size_changed(self):
-        self.aspect.set_ratio(self.width_spin.value() / max(self.height_spin.value(), 0.1))
+        # Figure W:H drives the preview proportions directly via _render_preview.
         self._schedule()
 
     def _set_size(self, w, h):
@@ -837,91 +1035,123 @@ class PlotterWindow(QtWidgets.QMainWindow):
          self.ylog_chk, self.yabs_chk) = self._ycol_row(lay, "Left Y")
 
         # --- Id + Ig content (requirement 1a) ---
-        gl = QtWidgets.QGridLayout()
-        lay.addLayout(gl)
+        r1 = QtWidgets.QHBoxLayout()
+        r1.setSpacing(4)
         self.show_ig_chk = QtWidgets.QCheckBox("Overlay |Ig|")
         self.show_ig_chk.toggled.connect(self._schedule)
-        gl.addWidget(self.show_ig_chk, 0, 0)
-        gl.addWidget(QtWidgets.QLabel("Ig axis"), 0, 1)
+        r1.addWidget(self.show_ig_chk)
+        r1.addWidget(QtWidgets.QLabel("axis"))
         self.ig_axis_combo = QtWidgets.QComboBox()
-        self.ig_axis_combo.addItems(["Same as Id", "Right axis (shared range)"])
+        self.ig_axis_combo.addItems(["Same as Id", "Right (shared)"])
+        self.ig_axis_combo.setToolTip(
+            "Right axis shares the same numeric range as the left axis")
+        self.ig_axis_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.ig_axis_combo.setMinimumContentsLength(8)
         self.ig_axis_combo.currentIndexChanged.connect(self._schedule)
-        gl.addWidget(self.ig_axis_combo, 0, 2)
-        gl.addWidget(QtWidgets.QLabel("Right Y label"), 1, 1)
+        r1.addWidget(self.ig_axis_combo, 1)
+        lay.addLayout(r1)
+
+        r2 = QtWidgets.QHBoxLayout()
+        r2.setSpacing(4)
+        r2.addWidget(QtWidgets.QLabel("Right Y"))
         self.y2label_edit = QtWidgets.QLineEdit(pretty_axis_label("absIg"))
         self.y2label_edit.editingFinished.connect(self._schedule)
-        gl.addWidget(self.y2label_edit, 1, 2)
+        r2.addWidget(self.y2label_edit, 1)
+        lay.addLayout(r2)
+
+    def _range_row(self):
+        """A compact min/max line that never overflows the panel width."""
+        rng = QtWidgets.QHBoxLayout()
+        rng.setSpacing(3)
+        rng.addWidget(QtWidgets.QLabel("min"))
+        mn = RangeEdit(self._schedule)
+        rng.addWidget(mn)
+        rng.addSpacing(6)
+        rng.addWidget(QtWidgets.QLabel("max"))
+        mx = RangeEdit(self._schedule)
+        rng.addWidget(mx)
+        return rng, mn, mx
 
     def _axis_row(self, lay, label):
-        grid = QtWidgets.QGridLayout()
-        lay.addLayout(grid)
-        grid.addWidget(QtWidgets.QLabel(label), 0, 0)
+        v = QtWidgets.QVBoxLayout()
+        v.setSpacing(3)
+        lay.addLayout(v)
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(QtWidgets.QLabel(label))
         lab = QtWidgets.QLineEdit()
         lab.editingFinished.connect(self._schedule)
-        grid.addWidget(lab, 0, 1, 1, 3)
-        grid.addWidget(QtWidgets.QLabel("min"), 1, 0)
-        mn = RangeEdit(self._schedule)
-        grid.addWidget(mn, 1, 1)
-        grid.addWidget(QtWidgets.QLabel("max"), 1, 2)
-        mx = RangeEdit(self._schedule)
-        grid.addWidget(mx, 1, 3)
+        top.addWidget(lab, 1)
+        v.addLayout(top)
+        rng, mn, mx = self._range_row()
+        rng.addStretch(1)
+        v.addLayout(rng)
         return lab, mn, mx
 
     def _ycol_row(self, lay, label):
-        grid = QtWidgets.QGridLayout()
-        lay.addLayout(grid)
-        grid.addWidget(QtWidgets.QLabel(label), 0, 0)
+        v = QtWidgets.QVBoxLayout()
+        v.setSpacing(3)
+        lay.addLayout(v)
+        top = QtWidgets.QHBoxLayout()
+        top.addWidget(QtWidgets.QLabel(label))
         combo = QtWidgets.QComboBox()
         combo.currentIndexChanged.connect(self._on_ycol_change)
         self._col_combos[label] = combo
-        grid.addWidget(combo, 0, 1)
+        top.addWidget(combo)
         lab = QtWidgets.QLineEdit()
         lab.editingFinished.connect(self._schedule)
-        grid.addWidget(lab, 0, 2, 1, 2)
-        grid.addWidget(QtWidgets.QLabel("min"), 1, 0)
-        mn = RangeEdit(self._schedule)
-        grid.addWidget(mn, 1, 1)
-        grid.addWidget(QtWidgets.QLabel("max"), 1, 2)
-        mx = RangeEdit(self._schedule)
-        grid.addWidget(mx, 1, 3)
-        opts = QtWidgets.QHBoxLayout()
+        top.addWidget(lab, 1)
+        v.addLayout(top)
+        rng, mn, mx = self._range_row()
+        rng.addSpacing(8)
         log = QtWidgets.QCheckBox("log")
         log.toggled.connect(self._schedule)
         abschk = QtWidgets.QCheckBox("abs")
         abschk.toggled.connect(self._schedule)
-        opts.addWidget(log)
-        opts.addWidget(abschk)
-        opts.addStretch(1)
-        grid.addLayout(opts, 2, 0, 1, 4)
+        rng.addWidget(log)
+        rng.addWidget(abschk)
+        rng.addStretch(1)
+        v.addLayout(rng)
         return combo, lab, mn, mx, log, abschk
 
     # ---- Curves -------------------------------------------------------- #
     def _build_curves_section(self, parent):
         lay = self._group(parent, "Curves")
         crow = QtWidgets.QHBoxLayout()
+        crow.setSpacing(4)
         crow.addWidget(QtWidgets.QLabel("Colour"))
         self.colormode_combo = QtWidgets.QComboBox()
         self.colormode_combo.addItems(["sequential", "categorical"])
         self.colormode_combo.setCurrentText(self.cfg.color_mode)
+        self.colormode_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.colormode_combo.setMinimumContentsLength(7)
         self.colormode_combo.currentIndexChanged.connect(self._recolor_and_plot)
-        crow.addWidget(self.colormode_combo)
+        crow.addWidget(self.colormode_combo, 1)
         crow.addWidget(QtWidgets.QLabel("Ramp"))
         self.ramp_combo = QtWidgets.QComboBox()
         self.ramp_combo.addItems(list(ns.SEQUENTIAL_RAMPS.keys()))
         self.ramp_combo.setCurrentText(self.cfg.ramp)
+        self.ramp_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.ramp_combo.setMinimumContentsLength(6)
         self.ramp_combo.currentIndexChanged.connect(self._recolor_and_plot)
-        crow.addWidget(self.ramp_combo)
+        crow.addWidget(self.ramp_combo, 1)
         lay.addLayout(crow)
 
         bar = QtWidgets.QHBoxLayout()
-        ball = QtWidgets.QPushButton("Show all")
+        bar.setSpacing(4)
+        ball = QtWidgets.QPushButton("Show")
+        ball.setToolTip("Show all curves")
         ball.clicked.connect(lambda: self._set_all_visible(True))
-        bnone = QtWidgets.QPushButton("Hide all")
+        bnone = QtWidgets.QPushButton("Hide")
+        bnone.setToolTip("Hide all curves")
         bnone.clicked.connect(lambda: self._set_all_visible(False))
         bar.addWidget(ball)
         bar.addWidget(bnone)
         bar.addStretch(1)
-        self.colorbar_chk = QtWidgets.QCheckBox("Colourbar")
+        self.colorbar_chk = QtWidgets.QCheckBox("Bar")
+        self.colorbar_chk.setToolTip("Show a colourbar instead of a legend")
         self.colorbar_chk.toggled.connect(self._schedule)
         self.legend_chk = QtWidgets.QCheckBox("Legend")
         self.legend_chk.setChecked(True)
@@ -986,26 +1216,29 @@ class PlotterWindow(QtWidgets.QMainWindow):
 
     # ---- Preprocess ---------------------------------------------------- #
     def _build_preprocess_section(self, parent):
-        scale = self._group(parent, "Scaling (multiplies current)")
+        scale = self._group(parent, "Scaling (× current)")
         grid = QtWidgets.QGridLayout()
         scale.addLayout(grid)
         grid.addWidget(QtWidgets.QLabel("Id × "), 0, 0)
         self.idscale_spin = self._dspin(1e-6, 1e6, 0.1, 1.0)
         self.idscale_spin.setDecimals(4)
+        self.idscale_spin.setFixedWidth(88)
         self.idscale_spin.valueChanged.connect(self._schedule)
         grid.addWidget(self.idscale_spin, 0, 1)
         grid.addWidget(QtWidgets.QLabel("Ig × "), 1, 0)
         self.igscale_spin = self._dspin(1e-6, 1e6, 0.1, 1.0)
         self.igscale_spin.setDecimals(4)
+        self.igscale_spin.setFixedWidth(88)
         self.igscale_spin.valueChanged.connect(self._schedule)
         grid.addWidget(self.igscale_spin, 1, 1)
+        grid.setColumnStretch(2, 1)
 
         # Independent smoothing for the drain and gate currents.
-        id_g = self._group(parent, "Drain current Id smoothing")
+        id_g = self._group(parent, "Id smoothing")
         self.id_smooth_ctrl = SmoothControls("Id", self._schedule)
         id_g.addWidget(self.id_smooth_ctrl)
 
-        ig_g = self._group(parent, "Gate current Ig smoothing")
+        ig_g = self._group(parent, "Ig smoothing")
         self.ig_smooth_ctrl = SmoothControls("Ig", self._schedule)
         ig_g.addWidget(self.ig_smooth_ctrl)
 
@@ -1080,12 +1313,16 @@ class PlotterWindow(QtWidgets.QMainWindow):
     # ---- Actions ------------------------------------------------------- #
     def _build_actions(self, parent):
         row = QtWidgets.QHBoxLayout()
+        reset = QtWidgets.QPushButton("Reset")
+        reset.setToolTip("Reset all settings to defaults (axes back to Auto)")
+        reset.clicked.connect(self._reset_settings)
         replot = QtWidgets.QPushButton("Apply / Replot")
         replot.clicked.connect(self._refresh_plot)
         copy = QtWidgets.QPushButton("Copy image")
         copy.clicked.connect(self.copy_to_clipboard)
         export = QtWidgets.QPushButton("Export…")
         export.clicked.connect(self.export)
+        row.addWidget(reset)
         row.addWidget(replot)
         row.addWidget(copy)
         row.addWidget(export)
@@ -1102,17 +1339,14 @@ class PlotterWindow(QtWidgets.QMainWindow):
         self._set_state("Copying…", busy=True)
         self._sync_cfg()
         buf = _io.BytesIO()
-        old_size = self.fig.get_size_inches().copy()
-        old_dpi = self.fig.get_dpi()
-        self.fig.set_size_inches(self.cfg.width_in, self.cfg.height_in)
-        try:
-            with matplotlib.rc_context(ns.rc_context(self.cfg)):
-                self.fig.savefig(buf, format="png", dpi=self.cfg.dpi,
-                                 bbox_inches="tight")
-        finally:
-            self.fig.set_size_inches(*old_size)
-            self.fig.set_dpi(old_dpi)
-            self.canvas.draw_idle()
+        # Render exactly like the preview (full figure, same layout), just at the
+        # export DPI — so the clipboard image matches the preview pixel-for-pixel
+        # in proportion.
+        with matplotlib.rc_context(ns.rc_context(self.cfg)):
+            self.fig.set_dpi(self.cfg.dpi)
+            self.fig.set_size_inches(self.cfg.width_in, self.cfg.height_in)
+            self.fig.savefig(buf, format="png", dpi=self.cfg.dpi)
+        self._render_preview()
         img = QtGui.QImage.fromData(buf.getvalue(), "PNG")
         QtWidgets.QApplication.clipboard().setImage(img)
         self._set_state("Ready")
@@ -1152,12 +1386,19 @@ class PlotterWindow(QtWidgets.QMainWindow):
             [f"{i+1:02d}. {m.name}" for i, m in enumerate(measurements)])
         self.meas_combo.setCurrentIndex(0)
         self.meas_combo.blockSignals(False)
-        self._on_measurement_selected()
+        # A freshly loaded dataset starts from defaults.
+        self._load_measurement(apply_defaults=True)
 
     # ------------------------------------------------------------------ #
     # Measurement selection
     # ------------------------------------------------------------------ #
     def _on_measurement_selected(self, *_):
+        # Switching the data source must NOT wipe the user's settings — only the
+        # curve list (and column choices) follow the data; labels, ranges, scale,
+        # smoothing, etc. are preserved. Use Reset to return to defaults.
+        self._load_measurement(apply_defaults=False)
+
+    def _load_measurement(self, apply_defaults: bool):
         idx = self.meas_combo.currentIndex()
         if idx < 0 or idx >= len(self.measurements):
             return
@@ -1173,8 +1414,27 @@ class PlotterWindow(QtWidgets.QMainWindow):
         avail = [c for c in CURRENT_COLUMNS_PREF if m.curves and m.curves[0].has(c)]
         if not avail:
             avail = [n for n in (m.curves[0].names if m.curves else []) if n != m.x_name]
+        prev_y = self.ycol_combo.currentText()
         self._set_combo_items(self.ycol_combo, avail)
 
+        has_ig = bool(m.curves and (m.curves[0].has("Ig") or m.curves[0].has("absIg")))
+        self.show_ig_chk.setEnabled(has_ig)
+        if not has_ig:
+            self.show_ig_chk.setChecked(False)
+        self.ig_smooth_ctrl.set_channel_available(has_ig)
+
+        if apply_defaults or prev_y not in avail:
+            # First load / Reset, or the previous column no longer exists.
+            self._apply_measurement_defaults(m, avail)
+        else:
+            # Preserve the user's column selection across the switch.
+            self._set_combo_text(self.ycol_combo, prev_y)
+
+        self._build_curve_rows()
+        self._refresh_plot()
+
+    def _apply_measurement_defaults(self, m, avail):
+        """Set the default columns/labels/scales/ranges for a measurement kind."""
         if m.kind == io.MeasurementKind.TRANSFER:
             ydef = "absId" if "absId" in avail else ("Id" if "Id" in avail else avail[0])
             self.ylog_chk.setChecked(True)
@@ -1183,23 +1443,15 @@ class PlotterWindow(QtWidgets.QMainWindow):
             ydef = "Id" if "Id" in avail else avail[0]
             self.ylog_chk.setChecked(False)
             self.yabs_chk.setChecked(False)
-
         self._set_combo_text(self.ycol_combo, ydef)
         self.xlabel_edit.setText(pretty_axis_label(m.x_name))
         self.ylabel_edit.setText(pretty_axis_label(ydef))
-        has_ig = bool(m.curves and (m.curves[0].has("Ig") or m.curves[0].has("absIg")))
-        self.show_ig_chk.setEnabled(has_ig)
-        if not has_ig:
-            self.show_ig_chk.setChecked(False)
-        self.ig_smooth_ctrl.set_channel_available(has_ig)
+        self.y2label_edit.setText(pretty_axis_label("absIg"))
         for e in (self.xmin_edit, self.xmax_edit, self.ymin_edit, self.ymax_edit):
             e.auto = True
             e.blockSignals(True)
             e.clear()
             e.blockSignals(False)
-
-        self._build_curve_rows()
-        self._refresh_plot()
 
     def _set_combo_items(self, combo, items):
         combo.blockSignals(True)
@@ -1230,7 +1482,9 @@ class PlotterWindow(QtWidgets.QMainWindow):
         self.cfg.font_size = float(self.fontsize_spin.value())
         self.cfg.line_width = float(self.linewidth_spin.value())
         self.cfg.tick_width = float(self.tickwidth_spin.value())
-        self.cfg.font_family = self.font_combo.currentText()
+        self.cfg.axes_line_width = float(self.borderwidth_spin.value())
+        # Font family is a preference (Edit → Preferences), not a per-figure field.
+        self.cfg.font_family = self.prefs.font_family
         self.cfg.full_box = self.fullbox_chk.isChecked()
         self.cfg.color_mode = self.colormode_combo.currentText()
         self.cfg.ramp = self.ramp_combo.currentText()
@@ -1269,7 +1523,7 @@ class PlotterWindow(QtWidgets.QMainWindow):
                         ha="center", va="center", transform=ax.transAxes,
                         color="#888")
                 ns.style_axes(ax, self.cfg, log_y=False)
-                self.canvas.draw_idle()
+                self._render_preview()
                 self._set_state("Ready")
                 return
 
@@ -1312,11 +1566,28 @@ class PlotterWindow(QtWidgets.QMainWindow):
                 ns.style_axes(ax2, self.cfg, log_y=log_y, right_axis=True)
 
             self._refresh_auto_ranges(ax, ax2)
-            self.canvas.draw_idle()
+            self._render_preview()
         n_vis = sum(1 for r in self.rows if r.visible)
         self.status_info.setText(
             f"{self.measurement.kind} · {n_vis}/{len(self.rows)} curve(s) shown")
         self._set_state("Ready")
+
+    def _render_preview(self):
+        """Render the figure at its fixed export size and show it scaled to fit.
+
+        The figure is always drawn at width×height inches; only the preview DPI
+        sets pixel density. Because the *whole* image is then scaled uniformly to
+        the preview area, font/line proportions are locked to the figure and the
+        preview matches the exported file exactly.
+        """
+        import numpy as _np
+        self.fig.set_dpi(PREVIEW_DPI)
+        self.fig.set_size_inches(self.cfg.width_in, self.cfg.height_in)
+        self.canvas.draw()
+        arr = _np.asarray(self.canvas.buffer_rgba())
+        h, w = arr.shape[:2]
+        qimg = QtGui.QImage(arr.data, w, h, QtGui.QImage.Format_RGBA8888).copy()
+        self.preview.set_figure_pixmap(QtGui.QPixmap.fromImage(qimg))
 
     def _draw_axis(self, ax, col, use_abs, log, right, dashed=False):
         for r in self.rows:
@@ -1407,8 +1678,8 @@ class PlotterWindow(QtWidgets.QMainWindow):
                                     fontsize=self.cfg.legend_size,
                                     xytext=(4, 0), textcoords="offset points")
             if show_onoff:
-                for lvl, name in ((p.ion, "I$_\\mathrm{on}$"),
-                                  (p.ioff, "I$_\\mathrm{off}$")):
+                for lvl, name in ((p.ion, r"$I_\mathrm{on}$"),
+                                  (p.ioff, r"$I_\mathrm{off}$")):
                     if lvl is not None and np.isfinite(lvl) and lvl > 0:
                         ax.axhline(lvl, color=color, linestyle="--",
                                    linewidth=self.cfg.axes_line_width, alpha=0.8)
@@ -1420,7 +1691,7 @@ class PlotterWindow(QtWidgets.QMainWindow):
                 ax.axvline(p.vth, color=color, linestyle=":",
                            linewidth=self.cfg.axes_line_width, alpha=0.8)
                 if label_ok:
-                    ax.annotate("V$_\\mathrm{th}$", (p.vth, 0.02),
+                    ax.annotate(r"$V_\mathrm{th}$", (p.vth, 0.02),
                                 xycoords=("data", "axes fraction"), color=color,
                                 fontsize=self.cfg.legend_size)
             if show_gm and np.isfinite(p.vth_gmmax):
@@ -1463,26 +1734,20 @@ class PlotterWindow(QtWidgets.QMainWindow):
         self._sync_cfg()
         saved: List[str] = []
 
-        # --- Image (PNG / SVG) at the export geometry ---
+        # --- Image (PNG / SVG) — rendered identically to the preview ---
         if sel["png"] or sel["svg"]:
-            old_size = self.fig.get_size_inches().copy()
-            old_dpi = self.fig.get_dpi()
-            self.fig.set_size_inches(self.cfg.width_in, self.cfg.height_in)
-            try:
-                with matplotlib.rc_context(ns.rc_context(self.cfg)):
-                    if sel["png"]:
-                        p = os.path.join(directory, stem + ".png")
-                        self.fig.savefig(p, dpi=max(self.cfg.dpi, 300),
-                                         bbox_inches="tight")
-                        saved.append(p)
-                    if sel["svg"]:
-                        p = os.path.join(directory, stem + ".svg")
-                        self.fig.savefig(p, bbox_inches="tight")
-                        saved.append(p)
-            finally:
-                self.fig.set_size_inches(*old_size)
-                self.fig.set_dpi(old_dpi)
-                self.canvas.draw_idle()
+            with matplotlib.rc_context(ns.rc_context(self.cfg)):
+                self.fig.set_dpi(self.cfg.dpi)
+                self.fig.set_size_inches(self.cfg.width_in, self.cfg.height_in)
+                if sel["png"]:
+                    p = os.path.join(directory, stem + ".png")
+                    self.fig.savefig(p, dpi=max(self.cfg.dpi, 300))
+                    saved.append(p)
+                if sel["svg"]:
+                    p = os.path.join(directory, stem + ".svg")
+                    self.fig.savefig(p)
+                    saved.append(p)
+            self._render_preview()
 
         # --- Data CSV: post-processed, original B1500 format & filename ---
         if sel["csv"]:
