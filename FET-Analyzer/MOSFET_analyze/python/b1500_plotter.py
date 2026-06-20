@@ -806,8 +806,9 @@ class PlotterWindow(QtWidgets.QMainWindow):
                    self.dpi_spin, self.fullbox_chk, self.colormode_combo,
                    self.ramp_combo, self.legend_chk, self.colorbar_chk,
                    self.title_edit, self.show_ig_chk, self.ig_axis_combo,
-                   self.idscale_spin, self.igscale_spin, self.ann_ss_chk,
-                   self.ann_onoff_chk, self.ann_vth_chk, self.ann_gm_chk]
+                   self.xscale_spin, self.xoffset_spin, self.idscale_spin,
+                   self.igscale_spin, self.ann_ss_chk, self.ann_onoff_chk,
+                   self.ann_vth_chk, self.ann_gm_chk]
         for w in widgets:
             w.blockSignals(True)
         self.width_spin.setValue(c.width_in)
@@ -825,6 +826,8 @@ class PlotterWindow(QtWidgets.QMainWindow):
         self.title_edit.clear()
         self.show_ig_chk.setChecked(False)
         self.ig_axis_combo.setCurrentIndex(0)
+        self.xscale_spin.setValue(1.0)
+        self.xoffset_spin.setValue(0.0)
         self.idscale_spin.setValue(1.0)
         self.igscale_spin.setValue(1.0)
         for a in (self.ann_ss_chk, self.ann_onoff_chk, self.ann_vth_chk,
@@ -1216,19 +1219,43 @@ class PlotterWindow(QtWidgets.QMainWindow):
 
     # ---- Preprocess ---------------------------------------------------- #
     def _build_preprocess_section(self, parent):
+        # X (sweep) axis transform: x_out = x * scale + offset.
+        xg = self._group(parent, "X axis (× scale + offset)")
+        xgrid = QtWidgets.QGridLayout()
+        xg.addLayout(xgrid)
+        xgrid.addWidget(QtWidgets.QLabel("Scale ×"), 0, 0)
+        self.xscale_spin = QtWidgets.QDoubleSpinBox()
+        self.xscale_spin.setRange(-1e6, 1e6)
+        self.xscale_spin.setDecimals(4)
+        self.xscale_spin.setSingleStep(0.1)
+        self.xscale_spin.setValue(1.0)
+        self.xscale_spin.setMinimumWidth(96)
+        self.xscale_spin.valueChanged.connect(self._schedule)
+        xgrid.addWidget(self.xscale_spin, 0, 1)
+        xgrid.addWidget(QtWidgets.QLabel("Offset +"), 1, 0)
+        self.xoffset_spin = QtWidgets.QDoubleSpinBox()
+        self.xoffset_spin.setRange(-1e9, 1e9)
+        self.xoffset_spin.setDecimals(4)
+        self.xoffset_spin.setSingleStep(1.0)
+        self.xoffset_spin.setValue(0.0)
+        self.xoffset_spin.setMinimumWidth(96)
+        self.xoffset_spin.valueChanged.connect(self._schedule)
+        xgrid.addWidget(self.xoffset_spin, 1, 1)
+        xgrid.setColumnStretch(2, 1)
+
         scale = self._group(parent, "Scaling (× current)")
         grid = QtWidgets.QGridLayout()
         scale.addLayout(grid)
         grid.addWidget(QtWidgets.QLabel("Id × "), 0, 0)
         self.idscale_spin = self._dspin(1e-6, 1e6, 0.1, 1.0)
         self.idscale_spin.setDecimals(4)
-        self.idscale_spin.setFixedWidth(88)
+        self.idscale_spin.setFixedWidth(96)
         self.idscale_spin.valueChanged.connect(self._schedule)
         grid.addWidget(self.idscale_spin, 0, 1)
         grid.addWidget(QtWidgets.QLabel("Ig × "), 1, 0)
         self.igscale_spin = self._dspin(1e-6, 1e6, 0.1, 1.0)
         self.igscale_spin.setDecimals(4)
-        self.igscale_spin.setFixedWidth(88)
+        self.igscale_spin.setFixedWidth(96)
         self.igscale_spin.valueChanged.connect(self._schedule)
         grid.addWidget(self.igscale_spin, 1, 1)
         grid.setColumnStretch(2, 1)
@@ -1488,6 +1515,8 @@ class PlotterWindow(QtWidgets.QMainWindow):
         self.cfg.full_box = self.fullbox_chk.isChecked()
         self.cfg.color_mode = self.colormode_combo.currentText()
         self.cfg.ramp = self.ramp_combo.currentText()
+        self.pre.x_scale = float(self.xscale_spin.value())
+        self.pre.x_offset = float(self.xoffset_spin.value())
         self.pre.id_scale = float(self.idscale_spin.value())
         self.pre.ig_scale = float(self.igscale_spin.value())
         self.pre.id_smooth = self.id_smooth_ctrl.spec()
@@ -1666,9 +1695,11 @@ class PlotterWindow(QtWidgets.QMainWindow):
             if p is None:
                 continue
             color = r.color
+            xt = self.pre.x_transform   # match the plotted (scaled/offset) x axis
             if show_ss:
                 vg_l, id_l = p.subthreshold_line()
                 if vg_l.size:
+                    vg_l = xt(vg_l)
                     ax.plot(vg_l, id_l, color=color, linestyle="-",
                             linewidth=self.cfg.axes_line_width, alpha=0.9)
                     if label_ok and np.isfinite(p.ss_mV_dec):
@@ -1688,14 +1719,15 @@ class PlotterWindow(QtWidgets.QMainWindow):
                                         color=color, fontsize=self.cfg.legend_size,
                                         va="bottom")
             if show_vth and np.isfinite(p.vth):
-                ax.axvline(p.vth, color=color, linestyle=":",
+                vth = float(xt(p.vth))
+                ax.axvline(vth, color=color, linestyle=":",
                            linewidth=self.cfg.axes_line_width, alpha=0.8)
                 if label_ok:
-                    ax.annotate(r"$V_\mathrm{th}$", (p.vth, 0.02),
+                    ax.annotate(r"$V_\mathrm{th}$", (vth, 0.02),
                                 xycoords=("data", "axes fraction"), color=color,
                                 fontsize=self.cfg.legend_size)
             if show_gm and np.isfinite(p.vth_gmmax):
-                ax.axvline(p.vth_gmmax, color=color, linestyle="-.",
+                ax.axvline(float(xt(p.vth_gmmax)), color=color, linestyle="-.",
                            linewidth=self.cfg.axes_line_width, alpha=0.6)
 
     def _draw_legend(self, ax):

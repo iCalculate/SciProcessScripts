@@ -66,12 +66,20 @@ class NoiseFloorSpec:
 class PreprocessConfig:
     """User-tunable preprocessing, driven by the Preprocess tab."""
 
+    # X (sweep) axis transform: x_out = x * x_scale + x_offset.
+    x_scale: float = 1.0
+    x_offset: float = 0.0
+
     id_scale: float = 1.0
     ig_scale: float = 1.0
     id_smooth: SmoothSpec = field(default_factory=SmoothSpec)
     ig_smooth: SmoothSpec = field(default_factory=SmoothSpec)
     id_noise: NoiseFloorSpec = field(default_factory=NoiseFloorSpec)
     ig_noise: NoiseFloorSpec = field(default_factory=NoiseFloorSpec)
+
+    def x_transform(self, v):
+        """Apply the X scale+offset to a scalar/array (for annotation positions)."""
+        return np.asarray(v, float) * self.x_scale + self.x_offset
 
     def scale_for(self, column: str) -> float:
         return self.ig_scale if channel_of(column) == "g" else self.id_scale
@@ -142,8 +150,10 @@ def apply_series(cfg: PreprocessConfig, x: np.ndarray, y: np.ndarray,
     """Return (x, y) after scaling, (linear) smoothing and an optional noise floor.
 
     Pipeline (all in linear current space): scale -> smooth -> add noise floor.
-    The caller applies abs()/log afterwards for display.
+    The X (sweep) axis is independently scaled/offset.  The caller applies
+    abs()/log afterwards for display.
     """
+    x = np.asarray(x, float) * cfg.x_scale + cfg.x_offset
     y = np.asarray(y, float) * cfg.scale_for(column)
     spec = cfg.smooth_for(column)
     if spec.enabled:

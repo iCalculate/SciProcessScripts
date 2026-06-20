@@ -69,6 +69,9 @@ The control panel is organised into three tabs.
 
 Refines the same plot without changing any Plot-tab styling:
 
+- **X axis** — scale and offset the sweep axis: `x → x × scale + offset` (e.g.
+  unit conversion, or shifting Vg so Vth sits at 0). Analysis annotations follow
+  the transform.
 - **Scaling** — independent multipliers for Id and Ig.
 - **Smoothing** — **Id and Ig smoothed independently**, each with its own method
   (**Savitzky–Golay / moving average / median / Gaussian**) and a live strength
