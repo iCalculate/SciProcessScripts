@@ -247,6 +247,29 @@ export interface NeuralTrainingStatus {
   error: string | null;
 }
 
+export interface DatabaseAnalysisStatus {
+  status: "idle" | "running" | "completed" | "failed";
+  stage:
+    | "idle"
+    | "loading_selection"
+    | "building_samples"
+    | "building_metrics"
+    | "computing_correlations"
+    | "computing_pca"
+    | "finalizing"
+    | "completed"
+    | "failed";
+  job_id: string | null;
+  message: string;
+  started_at: string | null;
+  completed_at: string | null;
+  elapsed_seconds: number;
+  progress_fraction: number;
+  selected_count: number;
+  result: DatabaseAnalysisResponse | null;
+  error: string | null;
+}
+
 export interface CurveSegment {
   direction: "forward" | "reverse" | "single";
   rows: number;

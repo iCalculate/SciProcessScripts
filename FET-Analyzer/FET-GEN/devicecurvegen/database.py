@@ -8,7 +8,7 @@ from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from sqlalchemy import (
@@ -58,7 +58,7 @@ from .features import analyze_transfer_curve
 
 DEFAULT_DATABASE_ENV = "DEVICEGEN_DATABASE_URL"
 BATCH_SIZE = 10_000
-ANALYSIS_SAMPLE_LIMIT = 8_000
+ANALYSIS_SAMPLE_LIMIT = 2_400
 ANALYSIS_HISTOGRAM_BINS = 32
 ANALYSIS_PCA_MAX_COMPONENTS = 6
 
@@ -75,6 +75,23 @@ ANALYSIS_NUMERIC_FEATURES = (
     "rows_clean",
     "voltage_span",
 )
+
+ANALYSIS_METRIC_SOURCE_KEYS = {
+    "ion": "ion",
+    "ioff": "ioff",
+    "logIon": "logIon",
+    "logIoff": "logIoff",
+    "logRatio": "logRatio",
+    "vth": "vth",
+    "ss_mv_dec": "ss_mv_dec",
+    "gm_max": "gm_max",
+    "logGm": "logGm",
+    "noise_log_sigma": "noise_log_sigma",
+    "ambipolar_strength": "ambipolar_strength",
+    "hysteresis_v": "hysteresis_v",
+    "rows_clean": "rows_clean",
+    "voltage_span": "voltage_span",
+}
 
 _schema_lock = Lock()
 _initialized_schema_urls: set[str] = set()
@@ -1795,6 +1812,52 @@ def _analysis_histogram(values: list[float]) -> list[dict[str, Any]]:
     ]
 
 
+def _analysis_metric_and_histogram(
+    values: list[float],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    finite = np.asarray([float(value) for value in values if np.isfinite(value)], dtype=float)
+    if finite.size == 0:
+        return (
+            {"count": 0, "min": None, "max": None, "mean": None, "median": None, "std": None},
+            [],
+        )
+    minimum = float(np.min(finite))
+    maximum = float(np.max(finite))
+    mean = float(np.mean(finite))
+    median = float(np.median(finite))
+    std = float(np.std(finite))
+    hist_minimum = minimum
+    hist_maximum = maximum
+    if hist_minimum == hist_maximum:
+        padding = max(abs(hist_minimum) * 0.05, 0.5)
+        hist_minimum -= padding
+        hist_maximum += padding
+    counts, edges = np.histogram(
+        finite,
+        bins=ANALYSIS_HISTOGRAM_BINS,
+        range=(hist_minimum, hist_maximum),
+    )
+    return (
+        {
+            "count": int(finite.size),
+            "min": minimum,
+            "max": maximum,
+            "mean": mean,
+            "median": median,
+            "std": std,
+        },
+        [
+            {
+                "start": float(edges[index]),
+                "end": float(edges[index + 1]),
+                "center": float((edges[index] + edges[index + 1]) / 2),
+                "count": int(count),
+            }
+            for index, count in enumerate(counts)
+        ],
+    )
+
+
 def _analysis_correlations(samples: list[dict[str, Any]]) -> dict[str, Any]:
     matrix: list[list[float | None]] = []
     counts: list[list[int]] = []
@@ -1931,7 +1994,20 @@ def analyze_curves(
     *,
     curve_ids: list[str] | None = None,
     filters: dict[str, Any] | None = None,
+    progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    def report(stage: str, progress_fraction: float, message: str) -> None:
+        if progress is None:
+            return
+        progress(
+            {
+                "stage": stage,
+                "progress_fraction": progress_fraction,
+                "message": message,
+            }
+        )
+
+    report("loading_selection", 0.02, "Opening the database and reading the selected curves")
     engine = create_database_engine(database_url)
     create_schema(engine)
     joined = curves.join(
@@ -1967,6 +2043,11 @@ def analyze_curves(
         query = query.where(and_(*conditions))
     with engine.connect() as connection:
         rows = [dict(row) for row in connection.execute(query).mappings()]
+        report(
+            "loading_selection",
+            0.22,
+            f"Loaded {len(rows):,} curves from the database selection",
+        )
         gate_points = 0
         aligned_gate_point_count = 0
         if rows:
@@ -1995,88 +2076,95 @@ def analyze_curves(
                     )
                     or 0
                 )
-    all_samples = [_analysis_sample(row) for row in rows]
-    display_samples = _analysis_display_samples(all_samples)
-    metric_sources = {
-        "ion": [sample["ion"] for sample in all_samples if sample["ion"] is not None],
-        "ioff": [sample["ioff"] for sample in all_samples if sample["ioff"] is not None],
-        "logIon": [sample["logIon"] for sample in all_samples if sample["logIon"] is not None],
-        "logIoff": [sample["logIoff"] for sample in all_samples if sample["logIoff"] is not None],
-        "logRatio": [
-            sample["logRatio"] for sample in all_samples if sample["logRatio"] is not None
-        ],
-        "vth": [sample["vth"] for sample in all_samples if sample["vth"] is not None],
-        "ss_mv_dec": [
-            sample["ss_mv_dec"] for sample in all_samples if sample["ss_mv_dec"] is not None
-        ],
-        "gm_max": [sample["gm_max"] for sample in all_samples if sample["gm_max"] is not None],
-        "logGm": [sample["logGm"] for sample in all_samples if sample["logGm"] is not None],
-        "noise_log_sigma": [
-            sample["noise_log_sigma"]
-            for sample in all_samples
-            if sample["noise_log_sigma"] is not None
-        ],
-        "ambipolar_strength": [
-            sample["ambipolar_strength"]
-            for sample in all_samples
-            if sample["ambipolar_strength"] is not None
-        ],
-        "hysteresis_v": [
-            sample["hysteresis_v"]
-            for sample in all_samples
-            if sample["hysteresis_v"] is not None
-        ],
-        "rows_clean": [
-            sample["rows_clean"] for sample in all_samples if sample["rows_clean"] is not None
-        ],
-        "voltage_span": [
-            sample["voltage_span"] for sample in all_samples if sample["voltage_span"] is not None
-        ],
+    report("building_samples", 0.28, "Converting selected curves into analysis samples")
+    all_samples: list[dict[str, Any]] = []
+    metric_sources: dict[str, list[float]] = {
+        metric: [] for metric in ANALYSIS_METRIC_SOURCE_KEYS
     }
-
-    def counts(key: str) -> dict[str, int]:
-        result: dict[str, int] = {}
-        for row in rows:
-            label = str(row[key])
-            result[label] = result.get(label, 0) + 1
-        return result
-
-    curves_with_ig = sum(1 for row in rows if row["has_gate_current"])
+    polarity_counts: dict[str, int] = {}
+    direction_counts: dict[str, int] = {}
+    source_kind_counts: dict[str, int] = {}
+    curves_with_ig = 0
+    hysteresis_paired = 0
+    unique_sources: set[str] = set()
+    raw_points = 0
+    sample_count = len(rows)
+    progress_step = max(250, min(2_000, sample_count // 16 if sample_count else 250))
+    for index, row in enumerate(rows, start=1):
+        sample = _analysis_sample(row)
+        all_samples.append(sample)
+        for metric, source_key in ANALYSIS_METRIC_SOURCE_KEYS.items():
+            value = sample[source_key]
+            if value is not None:
+                metric_sources[metric].append(value)
+        polarity = str(row["polarity"])
+        direction = str(row["direction"])
+        source_kind = str(row["source_kind"])
+        polarity_counts[polarity] = polarity_counts.get(polarity, 0) + 1
+        direction_counts[direction] = direction_counts.get(direction, 0) + 1
+        source_kind_counts[source_kind] = source_kind_counts.get(source_kind, 0) + 1
+        if row["has_gate_current"]:
+            curves_with_ig += 1
+        if row["hysteresis_v"] is not None:
+            hysteresis_paired += 1
+        unique_sources.add(str(row["source_path"]))
+        raw_points += int(row["rows_clean"] or 0)
+        if index == sample_count or index % progress_step == 0:
+            sample_progress = index / max(sample_count, 1)
+            report(
+                "building_samples",
+                0.28 + 0.28 * sample_progress,
+                f"Prepared {index:,}/{sample_count:,} analysis samples",
+            )
+    display_samples = _analysis_display_samples(all_samples)
+    report(
+        "building_metrics",
+        0.6,
+        f"Building summary metrics for {len(display_samples):,} plotted samples",
+    )
     spans = metric_sources["voltage_span"]
+    report("computing_correlations", 0.78, "Computing correlation trends across the sampled curves")
+    correlations = _analysis_correlations(display_samples)
+    report("computing_pca", 0.88, "Computing PCA structure and cluster-ready coordinates")
     pca = _analysis_pca(display_samples)
     pca["sampled"] = len(display_samples) < len(all_samples)
+    report("finalizing", 0.92, "Computing metric summaries and distributions")
+    metrics: dict[str, dict[str, Any]] = {}
+    distributions: dict[str, list[dict[str, Any]]] = {}
+    for metric, values in metric_sources.items():
+        metric_stats, histogram = _analysis_metric_and_histogram(values)
+        metrics[metric] = metric_stats
+        distributions[metric] = histogram
+    report("finalizing", 0.97, "Preparing categorical summaries and processing totals")
+    report("finalizing", 0.995, "Packaging the analysis response")
     return {
         "count": len(rows),
         "selected_mode": "ids" if curve_ids else "filters",
         "sample_count": len(display_samples),
         "sample_limit": ANALYSIS_SAMPLE_LIMIT,
         "samples": display_samples,
-        "metrics": {key: _analysis_metric(values) for key, values in metric_sources.items()},
-        "distributions": {
-            key: _analysis_histogram(values) for key, values in metric_sources.items()
-        },
-        "correlations": _analysis_correlations(display_samples),
+        "metrics": metrics,
+        "distributions": distributions,
+        "correlations": correlations,
         "pca": pca,
         "categorical": {
-            "polarity": counts("polarity"),
-            "direction": counts("direction"),
-            "source_kind": counts("source_kind"),
+            "polarity": polarity_counts,
+            "direction": direction_counts,
+            "source_kind": source_kind_counts,
             "has_ig": {"yes": curves_with_ig, "no": len(rows) - curves_with_ig},
             "hysteresis": {
-                "paired": sum(1 for row in rows if row["hysteresis_v"] is not None),
-                "NA": sum(1 for row in rows if row["hysteresis_v"] is None),
+                "paired": hysteresis_paired,
+                "NA": len(rows) - hysteresis_paired,
             },
         },
         "processing": {
-            "sources": len({row["source_path"] for row in rows}),
-            "raw_points": int(sum(row["rows_clean"] for row in rows)),
+            "sources": len(unique_sources),
+            "raw_points": raw_points,
             "aligned_points": int(len(rows) * X_NORM_GRID.size),
             "gate_points": gate_points,
             "aligned_gate_points": aligned_gate_point_count,
             "curves_with_ig": curves_with_ig,
-            "rows_clean_mean": (
-                statistics.fmean(row["rows_clean"] for row in rows) if rows else None
-            ),
+            "rows_clean_mean": metrics["rows_clean"]["mean"],
             "voltage_span_min": min(spans) if spans else None,
             "voltage_span_max": max(spans) if spans else None,
         },

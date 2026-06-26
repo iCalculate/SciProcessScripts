@@ -15,11 +15,13 @@ import {
   Table2,
   Target
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  analyzeDatabaseSelection,
+  ApiError,
   exportDatabaseSelection,
-  getDatabaseCurvePreviews
+  getDatabaseAnalysisStatus,
+  getDatabaseCurvePreviews,
+  startDatabaseAnalysis
 } from "../api";
 import { fixed, scientific } from "../format";
 import type {
@@ -28,6 +30,7 @@ import type {
   AnalysisPcaPoint,
   AnalysisSample,
   CurvePreview,
+  DatabaseAnalysisStatus,
   DatabaseAnalysisResponse,
   DatabaseSelectionState
 } from "../types";
@@ -35,6 +38,8 @@ import type {
 const Plot = createPlotlyComponent(Plotly);
 
 const PREVIEW_CURVE_LIMIT = 32;
+const ANALYSIS_SCATTER_RENDER_LIMIT = 1_600;
+const ANALYSIS_PCA_CLUSTER_LIMIT = 900;
 const EMPTY_PREVIEW = {
   title: "Preview",
   detail: "No active selection",
@@ -182,6 +187,30 @@ function histogramByWidth(
   return bins;
 }
 
+function smoothTrendFromBins(bins: AnalysisDistributionBin[], windowRadius = 2) {
+  if (bins.length === 0) return { x: [] as number[], y: [] as number[] };
+  const x = bins.map((bin) => bin.center);
+  const y = bins.map((_, index) => {
+    let sum = 0;
+    let weight = 0;
+    for (let offset = -windowRadius; offset <= windowRadius; offset += 1) {
+      const candidate = bins[index + offset];
+      if (!candidate) continue;
+      const w = windowRadius + 1 - Math.abs(offset);
+      sum += candidate.count * w;
+      weight += w;
+    }
+    return weight > 0 ? sum / weight : 0;
+  });
+  return { x, y };
+}
+
+function nextMetric(options: string[], current: string) {
+  const index = options.indexOf(current);
+  if (index < 0) return options[0] ?? current;
+  return options[(index + 1) % options.length] ?? current;
+}
+
 function densityCurve(values: number[], min: number, max: number, countScale: number) {
   if (values.length < 2 || !Number.isFinite(min) || !Number.isFinite(max) || min === max) {
     return { x: [] as number[], y: [] as number[] };
@@ -255,6 +284,50 @@ function plotConfig(selectable = false) {
   };
 }
 
+function sampleEvenly<T>(items: T[], limit: number): T[] {
+  if (items.length <= limit) return items;
+  const step = items.length / limit;
+  return Array.from({ length: limit }, (_, index) => items[Math.min(items.length - 1, Math.floor(index * step))]);
+}
+
+function AnalysisLoadingPanel({
+  selectionCount,
+  status
+}: {
+  selectionCount: number;
+  status: DatabaseAnalysisStatus | null;
+}) {
+  const progress = Math.max(0, Math.min(1, status?.progress_fraction ?? 0));
+  const progressLabel = status?.stage ?? "idle";
+  const progressDetail = status?.message ?? "Waiting for the analysis worker to start.";
+  const elapsedSeconds = status?.elapsed_seconds ?? 0;
+
+  return (
+    <section className="analysis-loading-panel" aria-live="polite">
+      <div className="analysis-loading-hero">
+        <div className="analysis-math-loader" aria-hidden="true">
+          <span />
+          <span />
+          <span />
+        </div>
+        <div className="analysis-loading-copy">
+          <strong>Analysis in progress</strong>
+          <p>{progressDetail} Progress is reported by the backend from the active analysis job.</p>
+        </div>
+        <span>{Math.round(progress * 100)}%</span>
+      </div>
+      <div className="analysis-loading-track active-pulse">
+        <div className="analysis-loading-fill" style={{ width: `${progress * 100}%` }} />
+      </div>
+      <div className="analysis-inline-stats">
+        <span>Selected scope <strong>{selectionCount.toLocaleString()}</strong></span>
+        <span>Stage <strong>{progressLabel}</strong></span>
+        <span>Elapsed <strong>{elapsedSeconds.toFixed(1)}s</strong></span>
+      </div>
+    </section>
+  );
+}
+
 function SummaryCard({ label, value, hint }: { label: string; value: string; hint: string }) {
   return (
     <div className="analysis-summary-card">
@@ -322,15 +395,7 @@ function HistogramExplorer({
   );
   const [activeBin, setActiveBin] = useState<AnalysisDistributionBin | null>(null);
   const maxCount = Math.max(1, ...bins.map((bin) => bin.count));
-  const density = useMemo(() => {
-    if (bins.length === 0) return { x: [] as number[], y: [] as number[] };
-    return densityCurve(
-      pairs.map((pair) => pair.value),
-      bins[0].start,
-      bins.at(-1)?.end ?? bins[0].end,
-      maxCount
-    );
-  }, [bins, maxCount, pairs]);
+  const trend = useMemo(() => smoothTrendFromBins(bins, 2), [bins]);
 
   useEffect(() => {
     setActiveBin(null);
@@ -356,10 +421,12 @@ function HistogramExplorer({
     {
       type: "scatter",
       mode: "lines",
-      x: density.x,
-      y: density.y,
-      line: { color: "#df7d10", width: 2 },
-      hoverinfo: "skip"
+      x: trend.x,
+      y: trend.y,
+      line: { color: "#df7d10", width: 2.5, shape: "spline", smoothing: 0.8 },
+      fill: "tozeroy",
+      fillcolor: "rgba(223, 125, 16, 0.14)",
+      hovertemplate: `Trend<br>${metricLabel(metric)} %{x:.3g}<br>smoothed count %{y:.2f}<extra></extra>`
     } as Data
   ];
 
@@ -411,7 +478,7 @@ function HistogramExplorer({
           <BarChart3 size={16} />
           <h2>Distribution</h2>
         </div>
-        <div className="analysis-control-row">
+        <div className="analysis-control-row analysis-control-row-grid">
           <label>
             Metric
             <select value={metric} onChange={(event) => onMetricChange(event.target.value)}>
@@ -446,6 +513,9 @@ function PreviewPanel({ request }: { request: PreviewRequest }) {
   const [details, setDetails] = useState<CurvePreview[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [xMin, setXMin] = useState<number | null>(null);
+  const [xMax, setXMax] = useState<number | null>(null);
+  const [hoveredCurveId, setHoveredCurveId] = useState<string | null>(null);
   const ids = useMemo(() => [...new Set(request.ids)].slice(0, PREVIEW_CURVE_LIMIT), [request.ids]);
 
   useEffect(() => {
@@ -476,19 +546,41 @@ function PreviewPanel({ request }: { request: PreviewRequest }) {
     };
   }, [ids]);
 
+  useEffect(() => {
+    setXMin(null);
+    setXMax(null);
+    setHoveredCurveId(null);
+  }, [request.ids]);
+
+  const allX = useMemo(
+    () => details.flatMap((detail) => detail.raw_points.map((point) => point.voltage_v)),
+    [details]
+  );
+  const previewXMin = allX.length > 0 ? Math.min(...allX) : null;
+  const previewXMax = allX.length > 0 ? Math.max(...allX) : null;
+
   const traces: Data[] = details.map((detail, index) => ({
     type: "scatter",
     mode: "lines",
     x: detail.raw_points.map((point) => point.voltage_v),
     y: detail.raw_points.map((point) => Math.log10(Math.max(Math.abs(point.current_a), Number.MIN_VALUE))),
+    customdata: detail.raw_points.map(() => detail.curve_id),
     name: sourceName(detail.source_path),
     text: detail.curve_id,
     showlegend: false,
     line: {
       color: colorFor(detail.polarity || String(index)),
-      width: details.length > 10 ? 1.2 : 1.8
+      width:
+        hoveredCurveId === detail.curve_id
+          ? 3.2
+          : details.length > 10
+            ? 1.2
+            : 1.8
     },
-    opacity: details.length > 10 ? 0.42 : 0.72,
+    opacity:
+      hoveredCurveId === null || hoveredCurveId === detail.curve_id
+        ? details.length > 10 ? 0.56 : 0.8
+        : 0.18,
     hovertemplate: `${detail.curve_id}<br>Vg %{x:.3g} V<br>log |Id| %{y:.3g}<extra></extra>`
   } as Data));
 
@@ -503,7 +595,8 @@ function PreviewPanel({ request }: { request: PreviewRequest }) {
       title: { text: "Gate voltage Vg (V)", standoff: 9 },
       gridcolor: "#eef2f7",
       linecolor: "#9cabc0",
-      ticks: "outside"
+      ticks: "outside",
+      range: xMin !== null && xMax !== null && xMax > xMin ? [xMin, xMax] : undefined
     },
     yaxis: {
       title: { text: "log10 |Id|", standoff: 8 },
@@ -521,12 +614,16 @@ function PreviewPanel({ request }: { request: PreviewRequest }) {
           <Eye size={16} />
           <h2>{request.title}</h2>
         </div>
-        <span className="analysis-subtle">
-          {request.ids.length > PREVIEW_CURVE_LIMIT
-            ? `${details.length}/${request.ids.length.toLocaleString()} curves`
-            : request.detail}
-        </span>
+        <div className="analysis-control-row analysis-control-row-compact">
+          <label>X min<input type="number" value={xMin ?? ""} placeholder={previewXMin === null ? "" : String(Number(previewXMin.toPrecision(4)))} onChange={(event) => setXMin(event.target.value ? Number(event.target.value) : null)} /></label>
+          <label>X max<input type="number" value={xMax ?? ""} placeholder={previewXMax === null ? "" : String(Number(previewXMax.toPrecision(4)))} onChange={(event) => setXMax(event.target.value ? Number(event.target.value) : null)} /></label>
+        </div>
       </div>
+      <span className="analysis-subtle">
+        {request.ids.length > PREVIEW_CURVE_LIMIT
+          ? `${details.length}/${request.ids.length.toLocaleString()} curves`
+          : request.detail}
+      </span>
       {error ? <div className="analysis-mini-error">{error}</div> : null}
       {loading ? (
         <div className="analysis-preview-loading"><RefreshCw className="spin" size={18} /> Loading preview</div>
@@ -541,6 +638,11 @@ function PreviewPanel({ request }: { request: PreviewRequest }) {
           config={plotConfig()}
           useResizeHandler
           className="analysis-plot analysis-preview-plot"
+          onHover={(event) => {
+            const curveId = (event.points?.[0] as { customdata?: unknown } | undefined)?.customdata;
+            setHoveredCurveId(typeof curveId === "string" ? curveId : null);
+          }}
+          onUnhover={() => setHoveredCurveId(null)}
         />
       ) : null}
     </section>
@@ -567,36 +669,80 @@ function ScatterExplorer({
   const [xMax, setXMax] = useState<number | null>(null);
   const [yMin, setYMin] = useState<number | null>(null);
   const [yMax, setYMax] = useState<number | null>(null);
+  const [openAxisMenu, setOpenAxisMenu] = useState<"x" | "y" | null>(null);
+  const availableMetrics = useMemo(
+    () => METRIC_OPTIONS.filter((option) => analysis.metrics[option]),
+    [analysis.metrics]
+  );
   const correlation = useMemo(() => pearsonFor(analysis.samples, xMetric, yMetric), [
     analysis.samples,
     xMetric,
     yMetric
   ]);
+  const renderPoints = useMemo(
+    () => sampleEvenly(correlation.points, ANALYSIS_SCATTER_RENDER_LIMIT),
+    [correlation.points]
+  );
   const groups = useMemo(() => {
     const buckets = new Map<string, typeof correlation.points>();
-    correlation.points.forEach((point) => {
+    renderPoints.forEach((point) => {
       const label = String(point.sample[colorBy]);
       buckets.set(label, [...(buckets.get(label) ?? []), point]);
     });
     return [...buckets.entries()].sort(([a], [b]) => a.localeCompare(b));
-  }, [colorBy, correlation.points]);
-  const xValues = correlation.points.map((point) => point.x);
-  const yValues = correlation.points.map((point) => point.y);
+  }, [colorBy, renderPoints]);
+  const filteredPoints = useMemo(
+    () =>
+      renderPoints.filter((point) => {
+        if (xMin !== null && point.x < xMin) return false;
+        if (xMax !== null && point.x > xMax) return false;
+        if (yMin !== null && point.y < yMin) return false;
+        if (yMax !== null && point.y > yMax) return false;
+        return true;
+      }),
+    [renderPoints, xMax, xMin, yMax, yMin]
+  );
+  const filteredIds = useMemo(
+    () => new Set(filteredPoints.map((point) => point.sample.curve_id)),
+    [filteredPoints]
+  );
+  const xValues = filteredPoints.map((point) => point.x);
+  const yValues = filteredPoints.map((point) => point.y);
   const xHist = histogramBins(xValues, 24);
   const yHist = histogramBins(yValues, 24);
-  const xDensity = xHist.length > 0
-    ? densityCurve(xValues, xHist[0].start, xHist.at(-1)?.end ?? xHist[0].end, Math.max(...xHist.map((bin) => bin.count), 1))
-    : { x: [] as number[], y: [] as number[] };
-  const yDensity = yHist.length > 0
-    ? densityCurve(yValues, yHist[0].start, yHist.at(-1)?.end ?? yHist[0].end, Math.max(...yHist.map((bin) => bin.count), 1))
-    : { x: [] as number[], y: [] as number[] };
+  const xDensity = smoothTrendFromBins(xHist, 2);
+  const yDensity = smoothTrendFromBins(yHist, 2);
+  const filteredCorrelation = useMemo(() => {
+    if (filteredPoints.length < 2) return { r: 0, r2: 0, slope: 0 };
+    const xMean = xValues.reduce((sum, value) => sum + value, 0) / xValues.length;
+    const yMean = yValues.reduce((sum, value) => sum + value, 0) / yValues.length;
+    let numerator = 0;
+    let xVariance = 0;
+    let yVariance = 0;
+    filteredPoints.forEach((point) => {
+      const dx = point.x - xMean;
+      const dy = point.y - yMean;
+      numerator += dx * dy;
+      xVariance += dx * dx;
+      yVariance += dy * dy;
+    });
+    const r = xVariance > 0 && yVariance > 0 ? numerator / Math.sqrt(xVariance * yVariance) : 0;
+    const slope = xVariance > 0 ? numerator / xVariance : 0;
+    return { r, r2: r * r, slope };
+  }, [filteredPoints, xValues, yValues]);
 
   const scatterTraces: Data[] = groups.map(([label, points]) => ({
     type: "scatter",
     mode: "markers",
-    x: points.map((point) => point.x),
-    y: points.map((point) => point.y),
-    customdata: points.map((point) => point.sample.curve_id),
+    x: points
+      .filter((point) => filteredIds.has(point.sample.curve_id))
+      .map((point) => point.x),
+    y: points
+      .filter((point) => filteredIds.has(point.sample.curve_id))
+      .map((point) => point.y),
+    customdata: points
+      .filter((point) => filteredIds.has(point.sample.curve_id))
+      .map((point) => point.sample.curve_id),
     name: label,
     marker: {
       color: colorFor(label),
@@ -626,7 +772,9 @@ function ScatterExplorer({
       y: xDensity.y,
       xaxis: "x",
       yaxis: "y2",
-      line: { color: "#df7d10", width: 1.8 },
+      line: { color: "#df7d10", width: 2.2, shape: "spline", smoothing: 0.8 },
+      fill: "tozeroy",
+      fillcolor: "rgba(223, 125, 16, 0.14)",
       hoverinfo: "skip",
       showlegend: false
     } as Data,
@@ -649,7 +797,9 @@ function ScatterExplorer({
       y: yDensity.x,
       xaxis: "x3",
       yaxis: "y",
-      line: { color: "#8b5cf6", width: 1.8 },
+      line: { color: "#8b5cf6", width: 2.2, shape: "spline", smoothing: 0.8 },
+      fill: "tozerox",
+      fillcolor: "rgba(139, 92, 246, 0.12)",
       hoverinfo: "skip",
       showlegend: false
     } as Data
@@ -662,11 +812,11 @@ function ScatterExplorer({
     plot_bgcolor: "#fbfdff",
     font: { family: "Segoe UI, system-ui, sans-serif", color: "#263a55", size: 10 },
     showlegend: true,
-    legend: { orientation: "h", x: 0, y: 1.14, font: { size: 9 } },
+    legend: { orientation: "v", x: 1.02, y: 0, yanchor: "bottom", font: { size: 9 } },
     dragmode: "select",
     xaxis: {
       domain: [0, 0.78],
-      title: { text: metricLabel(xMetric), standoff: 10 },
+      title: { text: "", standoff: 0 },
       gridcolor: "#eef2f7",
       linecolor: "#9cabc0",
       zeroline: false,
@@ -675,7 +825,7 @@ function ScatterExplorer({
     },
     yaxis: {
       domain: [0, 0.72],
-      title: { text: metricLabel(yMetric), standoff: 8 },
+      title: { text: "", standoff: 0 },
       gridcolor: "#eef2f7",
       linecolor: "#9cabc0",
       zeroline: false,
@@ -727,24 +877,12 @@ function ScatterExplorer({
           <ScatterChart size={16} />
           <h2>Scatter correlation</h2>
         </div>
-        <div className="analysis-control-row">
-          <label>
-            X
-            <select value={xMetric} onChange={(event) => onXMetricChange(event.target.value)}>
-              {METRIC_OPTIONS.map((option) => (
-                <option key={option} value={option}>{metricLabel(option)}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Y
-            <select value={yMetric} onChange={(event) => onYMetricChange(event.target.value)}>
-              {METRIC_OPTIONS.map((option) => (
-                <option key={option} value={option}>{metricLabel(option)}</option>
-              ))}
-            </select>
-          </label>
-          <label>
+        <div className="analysis-control-row analysis-control-row-grid">
+          <label>X min<input type="number" value={xMin ?? ""} onChange={(event) => setXMin(event.target.value ? Number(event.target.value) : null)} /></label>
+          <label>X max<input type="number" value={xMax ?? ""} onChange={(event) => setXMax(event.target.value ? Number(event.target.value) : null)} /></label>
+          <label>Y min<input type="number" value={yMin ?? ""} onChange={(event) => setYMin(event.target.value ? Number(event.target.value) : null)} /></label>
+          <label>Y max<input type="number" value={yMax ?? ""} onChange={(event) => setYMax(event.target.value ? Number(event.target.value) : null)} /></label>
+          <label className="analysis-color-control analysis-color-control-inline">
             Color
             <select value={colorBy} onChange={(event) => setColorBy(event.target.value as typeof colorBy)}>
               <option value="polarity">Polarity</option>
@@ -752,40 +890,245 @@ function ScatterExplorer({
               <option value="direction">Direction</option>
             </select>
           </label>
-          <label>X min<input type="number" value={xMin ?? ""} onChange={(event) => setXMin(event.target.value ? Number(event.target.value) : null)} /></label>
-          <label>X max<input type="number" value={xMax ?? ""} onChange={(event) => setXMax(event.target.value ? Number(event.target.value) : null)} /></label>
-          <label>Y min<input type="number" value={yMin ?? ""} onChange={(event) => setYMin(event.target.value ? Number(event.target.value) : null)} /></label>
-          <label>Y max<input type="number" value={yMax ?? ""} onChange={(event) => setYMax(event.target.value ? Number(event.target.value) : null)} /></label>
         </div>
       </div>
-      <Plot
-        data={data}
-        layout={layout}
-        config={plotConfig(true)}
-        useResizeHandler
-        className="analysis-plot analysis-scatter-plot"
-        onSelected={handleSelected}
-        onClick={handleClick}
-      />
+      <div className="analysis-scatter-shell">
+        <div className="analysis-axis-title analysis-axis-title-y">
+          <button type="button" onClick={() => setOpenAxisMenu((current) => current === "y" ? null : "y")}>
+            {metricLabel(yMetric)}
+          </button>
+          {openAxisMenu === "y" ? (
+            <div className="analysis-axis-menu">
+              {availableMetrics.map((option) => (
+                <button
+                  key={`y-${option}`}
+                  type="button"
+                  className={option === yMetric ? "active" : undefined}
+                  onClick={() => {
+                    onYMetricChange(option);
+                    setOpenAxisMenu(null);
+                  }}
+                >
+                  {metricLabel(option)}
+                </button>
+              ))}
+            </div>
+          ) : null}
+        </div>
+        <Plot
+          data={data}
+          layout={layout}
+          config={plotConfig(true)}
+          useResizeHandler
+          className="analysis-plot analysis-scatter-plot"
+          onSelected={handleSelected}
+          onClick={handleClick}
+        />
+        <div className="analysis-axis-title analysis-axis-title-x">
+          <button type="button" onClick={() => setOpenAxisMenu((current) => current === "x" ? null : "x")}>
+            {metricLabel(xMetric)}
+          </button>
+          {openAxisMenu === "x" ? (
+            <div className="analysis-axis-menu">
+              {availableMetrics.map((option) => (
+                <button
+                  key={`x-${option}`}
+                  type="button"
+                  className={option === xMetric ? "active" : undefined}
+                  onClick={() => {
+                    onXMetricChange(option);
+                    setOpenAxisMenu(null);
+                  }}
+                >
+                  {metricLabel(option)}
+                </button>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      </div>
       <div className="analysis-inline-stats">
-        <span>N {correlation.points.length.toLocaleString()}</span>
-        <span>r {fixed(correlation.r, 3)}</span>
-        <span>R2 {fixed(correlation.r2, 3)}</span>
-        <span>Slope {fixed(correlation.slope, 3)}</span>
+        <span>N {filteredPoints.length.toLocaleString()}</span>
+        <span>Plot sample {renderPoints.length.toLocaleString()}</span>
+        <span>r {fixed(filteredCorrelation.r, 3)}</span>
+        <span>R2 {fixed(filteredCorrelation.r2, 3)}</span>
+        <span>Slope {fixed(filteredCorrelation.slope, 3)}</span>
       </div>
     </section>
   );
 }
 
 function CorrelationPanel({ analysis }: { analysis: DatabaseAnalysisResponse }) {
-  const labels = analysis.correlations.features.map(metricLabel);
-  function cellColor(value: number | null): string {
-    if (value === null) return "#f1f5f9";
-    const strength = Math.min(1, Math.abs(value));
-    const target = value >= 0 ? [23, 105, 255] : [220, 63, 114];
-    const channel = (index: number) => Math.round(255 + (target[index] - 255) * strength);
-    return `rgb(${channel(0)}, ${channel(1)}, ${channel(2)})`;
+  const [hoveredCell, setHoveredCell] = useState<{ row: number; column: number } | null>(null);
+  const [pinnedCell, setPinnedCell] = useState<{ row: number; column: number } | null>(null);
+
+  const orderedIndexes = useMemo(() => {
+    const features = analysis.correlations.features;
+    const matrix = analysis.correlations.matrix;
+    if (features.length <= 2) return features.map((_, index) => index);
+    const remaining = new Set(features.map((_, index) => index));
+    const seed = features
+      .map((_, index) => ({
+        index,
+        strength: matrix[index].reduce(
+          (sum: number, value) => sum + (value === null ? 0 : Math.abs(value)),
+          0
+        )
+      }))
+      .sort((left, right) => right.strength - left.strength)[0]?.index ?? 0;
+    const ordered = [seed];
+    remaining.delete(seed);
+    while (remaining.size > 0) {
+      const last = ordered[ordered.length - 1];
+      let bestIndex = -1;
+      let bestScore = Number.NEGATIVE_INFINITY;
+      remaining.forEach((candidate) => {
+        const pairScore = Math.abs(matrix[last]?.[candidate] ?? 0);
+        const globalScore = matrix[candidate].reduce(
+          (sum: number, value) => sum + (value === null ? 0 : Math.abs(value)),
+          0
+        );
+        const score = pairScore * 10 + globalScore;
+        if (score > bestScore) {
+          bestScore = score;
+          bestIndex = candidate;
+        }
+      });
+      ordered.push(bestIndex);
+      remaining.delete(bestIndex);
+    }
+    return ordered;
+  }, [analysis.correlations.features, analysis.correlations.matrix]);
+
+  const orderedFeatures = orderedIndexes.map((index) => analysis.correlations.features[index]);
+  const labels = orderedFeatures.map(metricLabel);
+  const orderedMatrix = orderedIndexes.map((rowIndex) =>
+    orderedIndexes.map((columnIndex) => analysis.correlations.matrix[rowIndex]?.[columnIndex] ?? null)
+  );
+  const orderedCounts = orderedIndexes.map((rowIndex) =>
+    orderedIndexes.map((columnIndex) => analysis.correlations.counts[rowIndex]?.[columnIndex] ?? 0)
+  );
+
+  const activeCell = pinnedCell ?? hoveredCell;
+  const activeRowMetric = activeCell ? orderedFeatures[activeCell.row] ?? null : null;
+  const activeColMetric = activeCell ? orderedFeatures[activeCell.column] ?? null : null;
+  const activeValue = activeCell ? orderedMatrix[activeCell.row]?.[activeCell.column] ?? null : null;
+  const activeCount = activeCell ? orderedCounts[activeCell.row]?.[activeCell.column] ?? 0 : 0;
+
+  const strongestPairs = useMemo(() => {
+    const sourceMetric = activeRowMetric ?? orderedFeatures[0] ?? null;
+    if (!sourceMetric) return [] as Array<{ other: string; r: number; count: number }>;
+    const metricIndex = orderedFeatures.indexOf(sourceMetric);
+    if (metricIndex < 0) return [];
+    return orderedFeatures
+      .map((feature, index) => ({
+        other: feature,
+        r: orderedMatrix[metricIndex]?.[index] ?? null,
+        count: orderedCounts[metricIndex]?.[index] ?? 0
+      }))
+      .filter(
+        (item): item is { other: string; r: number; count: number } =>
+          item.r !== null && item.other !== sourceMetric
+      )
+      .sort((left, right) => Math.abs(right.r) - Math.abs(left.r))
+      .slice(0, 5);
+  }, [activeRowMetric, orderedCounts, orderedFeatures, orderedMatrix]);
+
+  const textMatrix = orderedMatrix.map((row, rowIndex) =>
+    row.map((value, columnIndex) => {
+      if (value === null) return "";
+      return rowIndex === columnIndex || Math.abs(value) >= 0.6 ? fixed(value, 2) : "";
+    })
+  );
+
+  const heatmapData: Data[] = [
+    {
+      type: "heatmap",
+      x: labels,
+      y: labels,
+      z: orderedMatrix.map((row) => row.map((value) => value ?? null)),
+      text: textMatrix,
+      texttemplate: "%{text}",
+      textfont: { size: 9, color: "#20334d" },
+      xgap: 2,
+      ygap: 2,
+      zmin: -1,
+      zmax: 1,
+      zmid: 0,
+      colorscale: [
+        [0, "#1d5fd1"],
+        [0.5, "#f8fbff"],
+        [1, "#cb2f69"]
+      ],
+      colorbar: {
+        title: { text: "r", side: "right" },
+        thickness: 14,
+        len: 0.84,
+        tickvals: [-1, -0.5, 0, 0.5, 1]
+      },
+      customdata: orderedCounts.map((row, rowIndex) =>
+        row.map((count, columnIndex) => [
+          orderedFeatures[rowIndex],
+          orderedFeatures[columnIndex],
+          count
+        ])
+      ),
+      hovertemplate:
+        "<b>%{customdata[0]}</b> vs <b>%{customdata[1]}</b><br>" +
+        "r = %{z:.3f}<br>" +
+        "N = %{customdata[2]}<extra></extra>"
+    } as unknown as Data
+  ];
+
+  const heatmapLayout: Partial<Layout> = {
+    autosize: true,
+    margin: { l: 92, r: 38, t: 18, b: 84 },
+    paper_bgcolor: "#ffffff",
+    plot_bgcolor: "#fbfdff",
+    font: { family: "Segoe UI, system-ui, sans-serif", color: "#263a55", size: 10 },
+    xaxis: {
+      side: "top",
+      tickangle: -35,
+      automargin: true,
+      tickfont: { size: 10 }
+    },
+    yaxis: {
+      automargin: true,
+      autorange: "reversed",
+      tickfont: { size: 10 },
+      scaleanchor: "x",
+      scaleratio: 1
+    }
+  };
+
+  function focusMetric(metric: string) {
+    const index = orderedFeatures.indexOf(metric);
+    if (index < 0) return;
+    setPinnedCell({ row: index, column: index });
   }
+
+  function handleHeatmapClick(event?: Readonly<PlotMouseEvent>) {
+    const point = event?.points?.[0] as
+      | { pointNumber?: [number, number] | number[] }
+      | undefined;
+    const pair = point?.pointNumber;
+    if (!pair || pair.length < 2) return;
+    const [row, column] = pair;
+    setPinnedCell((current) =>
+      current?.row === row && current?.column === column ? null : { row, column }
+    );
+  }
+
+  function handleHeatmapHover(event?: Readonly<PlotMouseEvent>) {
+    const point = event?.points?.[0] as
+      | { pointNumber?: [number, number] | number[] }
+      | undefined;
+    const pair = point?.pointNumber;
+    if (!pair || pair.length < 2) return;
+    const [row, column] = pair;
+    setHoveredCell({ row, column });
+  }
+
   return (
     <section className="analysis-chart-panel analysis-correlation-panel">
       <div className="analysis-panel-header">
@@ -794,70 +1137,406 @@ function CorrelationPanel({ analysis }: { analysis: DatabaseAnalysisResponse }) 
           <h2>Correlation map</h2>
         </div>
       </div>
-      <div
-        className="analysis-correlation-grid"
-        style={{ gridTemplateColumns: `76px repeat(${labels.length}, minmax(22px, 1fr))` }}
-      >
-        <span />
-        {labels.map((label) => <strong key={`x-${label}`}>{label}</strong>)}
-        {labels.map((rowLabel, rowIndex) => (
-          <div className="analysis-correlation-row" key={rowLabel}>
-            <b>{rowLabel}</b>
-            {analysis.correlations.matrix[rowIndex].map((value, columnIndex) => (
-              <span
-                key={`${rowLabel}-${labels[columnIndex]}`}
-                style={{ background: cellColor(value), color: value !== null && Math.abs(value) > 0.55 ? "#fff" : "#263a55" }}
-                title={`${rowLabel} / ${labels[columnIndex]}: ${value === null ? "NA" : value.toFixed(3)}`}
-              >
-                {value === null ? "—" : value.toFixed(2)}
-              </span>
-            ))}
-          </div>
-        ))}
+      <div className="analysis-correlation-topbar">
+        <div className="analysis-correlation-legend">
+          <span>Negative</span>
+          <b />
+          <span>Positive</span>
+        </div>
+        <div className="analysis-correlation-focus">
+          {activeCell ? (
+            <>
+              <strong>{metricLabel(activeRowMetric ?? "")} / {metricLabel(activeColMetric ?? "")}</strong>
+              <span>{activeValue === null ? "No usable overlap" : `r ${fixed(activeValue, 3)} · N ${activeCount.toLocaleString()}`}</span>
+            </>
+          ) : (
+            <span>Hover a cell to inspect one pair. Click to pin it and compare its strongest links.</span>
+          )}
+        </div>
       </div>
-      <div className="analysis-correlation-list">
-        {analysis.correlations.strongest.slice(0, 5).map((pair) => (
-          <span key={`${pair.x}-${pair.y}`}>
-            {metricLabel(pair.x)} / {metricLabel(pair.y)} <strong>{fixed(pair.r, 2)}</strong>
-          </span>
-        ))}
+      <div className="analysis-correlation-layout">
+        <div
+          className="analysis-correlation-plot-wrap"
+          onMouseLeave={() => setHoveredCell(null)}
+        >
+          <Plot
+            data={heatmapData}
+            layout={heatmapLayout}
+            config={plotConfig(false)}
+            useResizeHandler
+            className="analysis-plot analysis-correlation-plot"
+            onHover={handleHeatmapHover}
+            onClick={handleHeatmapClick}
+          />
+        </div>
+        <div className="analysis-correlation-detail">
+          {activeCell ? (
+            <>
+              <strong>{metricLabel(activeRowMetric ?? "")} / {metricLabel(activeColMetric ?? "")}</strong>
+              <b>{activeValue === null ? "NA" : fixed(activeValue, 3)}</b>
+              <span>
+                {activeValue === null
+                  ? "This pair does not have enough finite values."
+                  : activeValue >= 0
+                    ? "Positive relationship across the filtered population."
+                    : "Negative relationship across the filtered population."}
+              </span>
+            </>
+          ) : (
+            <>
+              <strong>Interactive heatmap</strong>
+              <span>
+                The matrix is reordered by correlation structure so related metrics stay visually grouped.
+              </span>
+            </>
+          )}
+          {strongestPairs.map((pair) => (
+            <button
+              key={`${activeRowMetric ?? "seed"}-${pair.other}`}
+              type="button"
+              className="analysis-correlation-pair"
+              onClick={() => focusMetric(pair.other)}
+            >
+              <span>{metricLabel(pair.other)}</span>
+              <b>{fixed(pair.r, 3)}</b>
+            </button>
+          ))}
+        </div>
       </div>
     </section>
   );
 }
 
-function clusterPca(points: AnalysisPcaPoint[], depth: number, clusterCount: number) {
+type NetworkNode = {
+  id: string;
+  label: string;
+  degree: number;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+};
+
+type NetworkEdge = {
+  source: string;
+  target: string;
+  r: number;
+};
+
+function buildCorrelationNetwork(
+  analysis: DatabaseAnalysisResponse,
+  threshold: number
+): { nodes: NetworkNode[]; edges: NetworkEdge[] } {
+  const nodes = analysis.correlations.features.map((feature, index) => ({
+    id: feature,
+    label: metricLabel(feature),
+    degree: 0,
+    x: 0.5 + Math.cos((Math.PI * 2 * index) / Math.max(analysis.correlations.features.length, 1)) * 0.28,
+    y: 0.5 + Math.sin((Math.PI * 2 * index) / Math.max(analysis.correlations.features.length, 1)) * 0.28,
+    vx: 0,
+    vy: 0
+  }));
+  const edges: NetworkEdge[] = [];
+  analysis.correlations.matrix.forEach((row, rowIndex) => {
+    row.forEach((value, columnIndex) => {
+      if (columnIndex <= rowIndex || value === null || Math.abs(value) < threshold) return;
+      edges.push({
+        source: analysis.correlations.features[rowIndex],
+        target: analysis.correlations.features[columnIndex],
+        r: value
+      });
+    });
+  });
+  const degreeById = new Map<string, number>();
+  edges.forEach((edge) => {
+    degreeById.set(edge.source, (degreeById.get(edge.source) ?? 0) + 1);
+    degreeById.set(edge.target, (degreeById.get(edge.target) ?? 0) + 1);
+  });
+  return {
+    nodes: nodes.map((node) => ({ ...node, degree: degreeById.get(node.id) ?? 0 })),
+    edges
+  };
+}
+
+function CorrelationNetworkPanel({ analysis }: { analysis: DatabaseAnalysisResponse }) {
+  const [threshold, setThreshold] = useState(0.45);
+  const [activeNode, setActiveNode] = useState<string | null>(null);
+  const baseNetwork = useMemo(() => buildCorrelationNetwork(analysis, threshold), [analysis, threshold]);
+  const [nodes, setNodes] = useState<NetworkNode[]>(baseNetwork.nodes);
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const dragRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    setNodes(baseNetwork.nodes);
+    setActiveNode(null);
+  }, [baseNetwork]);
+
+  useEffect(() => {
+    let frame = 0;
+    let cancelled = false;
+
+    const step = () => {
+      setNodes((current) => {
+        const indexById = new Map(current.map((node, index) => [node.id, index]));
+        const next = current.map((node) => ({ ...node }));
+        next.forEach((node, index) => {
+          if (dragRef.current === node.id) {
+            node.vx = 0;
+            node.vy = 0;
+            return;
+          }
+          let fx = 0;
+          let fy = 0;
+          next.forEach((other, otherIndex) => {
+            if (index === otherIndex) return;
+            const dx = node.x - other.x;
+            const dy = node.y - other.y;
+            const dist = Math.max(0.001, Math.sqrt(dx * dx + dy * dy));
+            const repel = 0.0013 / (dist * dist);
+            fx += (dx / dist) * repel;
+            fy += (dy / dist) * repel;
+          });
+          baseNetwork.edges.forEach((edge) => {
+            if (edge.source !== node.id && edge.target !== node.id) return;
+            const otherIndex = indexById.get(edge.source === node.id ? edge.target : edge.source);
+            if (otherIndex === undefined) return;
+            const other = next[otherIndex];
+            const dx = other.x - node.x;
+            const dy = other.y - node.y;
+            const dist = Math.max(0.001, Math.sqrt(dx * dx + dy * dy));
+            const spring = (dist - 0.22) * 0.026 * (0.65 + Math.abs(edge.r));
+            fx += (dx / dist) * spring;
+            fy += (dy / dist) * spring;
+          });
+          fx += (0.5 - node.x) * 0.004;
+          fy += (0.5 - node.y) * 0.004;
+          node.vx = (node.vx + fx) * 0.84;
+          node.vy = (node.vy + fy) * 0.84;
+        });
+        next.forEach((node) => {
+          if (dragRef.current === node.id) return;
+          node.x = Math.min(0.92, Math.max(0.08, node.x + node.vx));
+          node.y = Math.min(0.92, Math.max(0.08, node.y + node.vy));
+        });
+        return next;
+      });
+      if (!cancelled) frame = window.requestAnimationFrame(step);
+    };
+
+    frame = window.requestAnimationFrame(step);
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(frame);
+    };
+  }, [baseNetwork.edges]);
+
+  useEffect(() => {
+    function updateDrag(clientX: number, clientY: number) {
+      const draggingId = dragRef.current;
+      const svg = svgRef.current;
+      if (!draggingId || !svg) return;
+      const bounds = svg.getBoundingClientRect();
+      const x = Math.min(0.92, Math.max(0.08, (clientX - bounds.left) / Math.max(bounds.width, 1)));
+      const y = Math.min(0.92, Math.max(0.08, (clientY - bounds.top) / Math.max(bounds.height, 1)));
+      setNodes((current) =>
+        current.map((node) =>
+          node.id === draggingId ? { ...node, x, y, vx: 0, vy: 0 } : node
+        )
+      );
+    }
+
+    const handleMove = (event: PointerEvent) => updateDrag(event.clientX, event.clientY);
+    const handleUp = () => {
+      dragRef.current = null;
+    };
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp);
+    return () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+    };
+  }, []);
+
+  const connectedIds = useMemo(() => {
+    if (activeNode === null) return new Set<string>();
+    const ids = new Set<string>([activeNode]);
+    baseNetwork.edges.forEach((edge) => {
+      if (edge.source === activeNode) ids.add(edge.target);
+      if (edge.target === activeNode) ids.add(edge.source);
+    });
+    return ids;
+  }, [activeNode, baseNetwork.edges]);
+
+  const activeLinks = useMemo(() => {
+    if (activeNode === null) return [] as NetworkEdge[];
+    return baseNetwork.edges
+      .filter((edge) => edge.source === activeNode || edge.target === activeNode)
+      .sort((left, right) => Math.abs(right.r) - Math.abs(left.r))
+      .slice(0, 4);
+  }, [activeNode, baseNetwork.edges]);
+
+  return (
+    <section className="analysis-chart-panel analysis-network-panel">
+      <div className="analysis-panel-header">
+        <div>
+          <Target size={16} />
+          <h2>Correlation network</h2>
+        </div>
+        <div className="analysis-control-row analysis-control-row-grid">
+          <label>
+            Threshold
+            <input
+              type="range"
+              min={0.2}
+              max={0.85}
+              step={0.05}
+              value={threshold}
+              onChange={(event) => setThreshold(Number(event.target.value))}
+            />
+            <strong>{fixed(threshold, 2)}</strong>
+          </label>
+        </div>
+      </div>
+      <div className="analysis-network-shell">
+        <svg
+          ref={svgRef}
+          className="analysis-network-svg"
+          viewBox="0 0 1000 1000"
+          role="img"
+          aria-label="Draggable correlation network"
+        >
+          {baseNetwork.edges.map((edge) => {
+            const source = nodes.find((node) => node.id === edge.source);
+            const target = nodes.find((node) => node.id === edge.target);
+            if (!source || !target) return null;
+            const highlighted = activeNode !== null && (edge.source === activeNode || edge.target === activeNode);
+            return (
+              <line
+                key={`${edge.source}-${edge.target}`}
+                x1={source.x * 1000}
+                y1={source.y * 1000}
+                x2={target.x * 1000}
+                y2={target.y * 1000}
+                stroke={edge.r >= 0 ? "#cb2f69" : "#1d5fd1"}
+                strokeOpacity={activeNode === null ? 0.34 : highlighted ? 0.88 : 0.1}
+                strokeWidth={2 + Math.abs(edge.r) * 7}
+              />
+            );
+          })}
+          {nodes.map((node) => {
+            const active = activeNode === node.id;
+            const related = activeNode === null || connectedIds.has(node.id);
+            const radius = 24 + Math.min(node.degree, 6) * 4;
+            return (
+              <g
+                key={node.id}
+                className="analysis-network-node"
+                transform={`translate(${node.x * 1000} ${node.y * 1000})`}
+                onMouseEnter={() => setActiveNode(node.id)}
+                onMouseLeave={() => setActiveNode(null)}
+                onPointerDown={(event) => {
+                  dragRef.current = node.id;
+                  setActiveNode(node.id);
+                  event.currentTarget.setPointerCapture(event.pointerId);
+                }}
+              >
+                <circle
+                  r={radius}
+                  fill={active ? "#1459cb" : "#ffffff"}
+                  fillOpacity={related ? 0.98 : 0.42}
+                  stroke={active ? "#1459cb" : "#c7d4e3"}
+                  strokeWidth={active ? 4 : 2}
+                />
+                <text
+                  textAnchor="middle"
+                  dominantBaseline="central"
+                  fill={active ? "#ffffff" : "#263a55"}
+                  fontSize="24"
+                  fontWeight="700"
+                >
+                  {node.label}
+                </text>
+              </g>
+            );
+          })}
+        </svg>
+      </div>
+      <div className="analysis-inline-stats">
+        <span>Nodes <strong>{nodes.length.toLocaleString()}</strong></span>
+        <span>Edges <strong>{baseNetwork.edges.length.toLocaleString()}</strong></span>
+        <span>Threshold <strong>{fixed(threshold, 2)}</strong></span>
+        <span>{activeNode ? `Focus ${metricLabel(activeNode)}` : "Drag a node to reshape the graph"}</span>
+      </div>
+      {activeNode ? (
+        <div className="analysis-correlation-list">
+          {activeLinks.map((edge) => {
+            const other = edge.source === activeNode ? edge.target : edge.source;
+            return (
+              <span key={`${activeNode}-${other}`}>
+                {metricLabel(other)}
+                <strong>{fixed(edge.r, 3)}</strong>
+              </span>
+            );
+          })}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+type PcaClusterResult = {
+  assignments: Map<string, number>;
+  idsByCluster: Map<number, string[]>;
+  clusterSizes: Record<string, number>;
+  score: number;
+};
+
+function vectorDistanceSquared(left: number[], right: number[]) {
+  return left.reduce((sum, value, index) => {
+    const delta = value - right[index];
+    return sum + delta * delta;
+  }, 0);
+}
+
+function clusterPca(points: AnalysisPcaPoint[], depth: number, clusterCount: number): PcaClusterResult {
   const usable = points.filter((point) => point.scores.length >= depth);
   const assignments = new Map<string, number>();
+  const idsByCluster = new Map<number, string[]>();
+  const clusterSizes: Record<string, number> = {};
   const k = Math.min(clusterCount, usable.length);
-  if (k <= 0) return assignments;
+  if (k <= 0) {
+    return { assignments, idsByCluster, clusterSizes, score: -1 };
+  }
   if (k === 1) {
-    usable.forEach((point) => assignments.set(point.curve_id, 0));
-    return assignments;
+    usable.forEach((point) => {
+      assignments.set(point.curve_id, 0);
+      idsByCluster.set(0, [...(idsByCluster.get(0) ?? []), point.curve_id]);
+    });
+    clusterSizes.C1 = usable.length;
+    return { assignments, idsByCluster, clusterSizes, score: 0 };
   }
   const ordered = [...usable].sort((a, b) => a.curve_id.localeCompare(b.curve_id));
+  const vectors = ordered.map((point) => point.scores.slice(0, depth));
   let centroids = Array.from({ length: k }, (_, index) => {
     const source = ordered[Math.round((index * (ordered.length - 1)) / (k - 1))];
     return source.scores.slice(0, depth);
   });
-  for (let iteration = 0; iteration < 28; iteration += 1) {
+  let indexes = new Array<number>(ordered.length).fill(0);
+  for (let iteration = 0; iteration < 32; iteration += 1) {
     const buckets = Array.from({ length: k }, () => [] as number[][]);
-    usable.forEach((point) => {
-      const vector = point.scores.slice(0, depth);
+    indexes = ordered.map((_, pointIndex) => {
+      const vector = vectors[pointIndex];
       let bestIndex = 0;
       let bestDistance = Number.POSITIVE_INFINITY;
       centroids.forEach((centroid, centroidIndex) => {
-        const distance = vector.reduce((sum, value, valueIndex) => {
-          const delta = value - centroid[valueIndex];
-          return sum + delta * delta;
-        }, 0);
+        const distance = vectorDistanceSquared(vector, centroid);
         if (distance < bestDistance) {
           bestDistance = distance;
           bestIndex = centroidIndex;
         }
       });
-      assignments.set(point.curve_id, bestIndex);
       buckets[bestIndex].push(vector);
+      return bestIndex;
     });
     centroids = centroids.map((centroid, centroidIndex) => {
       const bucket = buckets[centroidIndex];
@@ -867,7 +1546,55 @@ function clusterPca(points: AnalysisPcaPoint[], depth: number, clusterCount: num
       );
     });
   }
-  return assignments;
+
+  ordered.forEach((point, pointIndex) => {
+    const clusterIndex = indexes[pointIndex];
+    assignments.set(point.curve_id, clusterIndex);
+    idsByCluster.set(clusterIndex, [...(idsByCluster.get(clusterIndex) ?? []), point.curve_id]);
+  });
+  idsByCluster.forEach((ids, clusterIndex) => {
+    clusterSizes[`C${clusterIndex + 1}`] = ids.length;
+  });
+  const sampleIndexes = sampleEvenly(
+    indexes.map((_, index) => index),
+    Math.min(320, indexes.length)
+  );
+  const silhouetteValues = sampleIndexes.map((pointIndex) => {
+    const clusterIndex = indexes[pointIndex];
+    const vector = vectors[pointIndex];
+    const ownCentroid = centroids[clusterIndex];
+    const a = Math.sqrt(vectorDistanceSquared(vector, ownCentroid));
+    let b = Number.POSITIVE_INFINITY;
+    centroids.forEach((centroid, centroidIndex) => {
+      if (centroidIndex === clusterIndex) return;
+      b = Math.min(b, Math.sqrt(vectorDistanceSquared(vector, centroid)));
+    });
+    if (!Number.isFinite(b)) return 0;
+    return (b - a) / Math.max(a, b, 1e-9);
+  });
+  const score =
+    silhouetteValues.length > 0
+      ? silhouetteValues.reduce((sum, value) => sum + value, 0) / silhouetteValues.length
+      : -1;
+  return { assignments, idsByCluster, clusterSizes, score };
+}
+
+function chooseAutoClusterCount(points: AnalysisPcaPoint[], depth: number, options: number[]) {
+  const usable = points.filter((point) => point.scores.length >= depth);
+  if (usable.length < 4) return Math.min(2, Math.max(1, usable.length));
+  let bestCount = Math.min(3, usable.length);
+  let bestScore = Number.NEGATIVE_INFINITY;
+  options.forEach((option) => {
+    if (option > usable.length || option < 2) return;
+    const result = clusterPca(usable, depth, option);
+    const normalizedPenalty = option / Math.max(usable.length, 8);
+    const score = result.score - normalizedPenalty * 0.08;
+    if (score > bestScore) {
+      bestScore = score;
+      bestCount = option;
+    }
+  });
+  return bestCount;
 }
 
 function PcaExplorer({
@@ -878,8 +1605,12 @@ function PcaExplorer({
   onPreview: (request: PreviewRequest) => void;
 }) {
   const componentCount = analysis.pca.components.length;
+  const plottedPcaPoints = useMemo(
+    () => sampleEvenly(analysis.pca.points, ANALYSIS_PCA_CLUSTER_LIMIT),
+    [analysis.pca.points]
+  );
   const [depth, setDepth] = useState(2);
-  const [clusterCount, setClusterCount] = useState(3);
+  const [clusterCount, setClusterCount] = useState<number | "auto">("auto");
   const [colorMode, setColorMode] = useState<ColorMode>("cluster");
   const [xComponent, setXComponent] = useState(0);
   const [yComponent, setYComponent] = useState(1);
@@ -890,21 +1621,31 @@ function PcaExplorer({
     setYComponent((current) => Math.min(Math.max(1, current), Math.max(0, componentCount - 1)));
   }, [componentCount]);
 
-  const clusters = useMemo(
-    () => clusterPca(analysis.pca.points, Math.min(depth, componentCount), clusterCount),
-    [analysis.pca.points, clusterCount, componentCount, depth]
+  const clusterOptions = useMemo(
+    () => [2, 3, 4, 5, 6, 8].filter((value) => value <= Math.max(2, plottedPcaPoints.length)),
+    [plottedPcaPoints.length]
+  );
+  const effectiveDepth = Math.min(depth, componentCount);
+  const autoClusterCount = useMemo(
+    () => chooseAutoClusterCount(plottedPcaPoints, effectiveDepth, clusterOptions),
+    [plottedPcaPoints, clusterOptions, effectiveDepth]
+  );
+  const effectiveClusterCount = clusterCount === "auto" ? autoClusterCount : clusterCount;
+  const clusterResult = useMemo(
+    () => clusterPca(plottedPcaPoints, effectiveDepth, effectiveClusterCount),
+    [plottedPcaPoints, effectiveClusterCount, effectiveDepth]
   );
   const grouped = useMemo(() => {
     const buckets = new Map<string, AnalysisPcaPoint[]>();
-    analysis.pca.points.forEach((point) => {
+    plottedPcaPoints.forEach((point) => {
       if (point.scores.length <= Math.max(xComponent, yComponent)) return;
       const label = colorMode === "cluster"
-        ? `Cluster ${(clusters.get(point.curve_id) ?? 0) + 1}`
+        ? `Cluster ${(clusterResult.assignments.get(point.curve_id) ?? 0) + 1}`
         : String(point[colorMode]);
       buckets.set(label, [...(buckets.get(label) ?? []), point]);
     });
     return [...buckets.entries()].sort(([a], [b]) => a.localeCompare(b));
-  }, [analysis.pca.points, clusters, colorMode, xComponent, yComponent]);
+  }, [plottedPcaPoints, clusterResult.assignments, colorMode, xComponent, yComponent]);
 
   if (componentCount < 2) {
     return (
@@ -964,7 +1705,7 @@ function PcaExplorer({
       linecolor: "#9cabc0",
       ticks: "outside"
     },
-    uirevision: `pca-${depth}-${clusterCount}-${colorMode}-${xComponent}-${yComponent}`
+    uirevision: `pca-${depth}-${effectiveClusterCount}-${colorMode}-${xComponent}-${yComponent}`
   };
 
   function previewIds(ids: string[], title: string) {
@@ -981,14 +1722,23 @@ function PcaExplorer({
 
   function handleClick(event?: Readonly<PlotMouseEvent>) {
     const id = (event?.points?.[0] as { customdata?: unknown } | undefined)?.customdata;
-    if (typeof id === "string") previewIds([id], id);
+    if (typeof id !== "string") return;
+    if (colorMode === "cluster") {
+      const clusterIndex = clusterResult.assignments.get(id);
+      const ids = clusterIndex === undefined ? [id] : (clusterResult.idsByCluster.get(clusterIndex) ?? [id]);
+      previewIds(ids, `Cluster ${clusterIndex === undefined ? "?" : clusterIndex + 1}`);
+      return;
+    }
+    previewIds([id], id);
   }
 
-  const clusterSizes = [...clusters.values()].reduce<Record<string, number>>((result, cluster) => {
-    const label = `C${cluster + 1}`;
-    result[label] = (result[label] ?? 0) + 1;
-    return result;
-  }, {});
+  const clusterSizes = clusterResult.clusterSizes;
+  const xLoadings = Object.entries(analysis.pca.components[xComponent].loadings)
+    .sort(([, a], [, b]) => Math.abs(b) - Math.abs(a))
+    .slice(0, 5);
+  const yLoadings = Object.entries(analysis.pca.components[yComponent].loadings)
+    .sort(([, a], [, b]) => Math.abs(b) - Math.abs(a))
+    .slice(0, 5);
 
   return (
     <section className="analysis-chart-panel analysis-pca-panel">
@@ -997,54 +1747,8 @@ function PcaExplorer({
           <SlidersHorizontal size={16} />
           <h2>PCA workspace</h2>
         </div>
-        <div className="analysis-control-row">
-          <label>
-            Depth
-            <input
-              type="range"
-              min={1}
-              max={componentCount}
-              value={depth}
-              onChange={(event) => setDepth(Number(event.target.value))}
-            />
-            <strong>{depth}</strong>
-          </label>
-          <label>
-            Clusters
-            <select value={clusterCount} onChange={(event) => setClusterCount(Number(event.target.value))}>
-              {[2, 3, 4, 5, 6, 8].filter((value) => value <= Math.max(2, analysis.pca.points.length)).map((value) => (
-                <option key={value} value={value}>{value}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Color
-            <select value={colorMode} onChange={(event) => setColorMode(event.target.value as ColorMode)}>
-              <option value="cluster">Cluster</option>
-              <option value="polarity">Polarity</option>
-              <option value="source_kind">Source</option>
-              <option value="direction">Direction</option>
-            </select>
-          </label>
-          <label>
-            X
-            <select value={xComponent} onChange={(event) => setXComponent(Number(event.target.value))}>
-              {analysis.pca.components.map((component, index) => (
-                <option key={component.name} value={index}>{component.name}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Y
-            <select value={yComponent} onChange={(event) => setYComponent(Number(event.target.value))}>
-              {analysis.pca.components.map((component, index) => (
-                <option key={component.name} value={index}>{component.name}</option>
-              ))}
-            </select>
-          </label>
-        </div>
       </div>
-      <div className="analysis-pca-content">
+      <div className="analysis-pca-stage">
         <Plot
           data={data}
           layout={layout}
@@ -1054,7 +1758,9 @@ function PcaExplorer({
           onSelected={handleSelected}
           onClick={handleClick}
         />
-        <aside className="analysis-pca-side">
+      </div>
+      <div className="analysis-pca-summary-grid">
+        <section className="analysis-pca-side-card analysis-pca-compact-card">
           <h3>Explained variance</h3>
           <div className="analysis-pca-bars">
             {analysis.pca.components.map((component) => (
@@ -1065,22 +1771,96 @@ function PcaExplorer({
               </div>
             ))}
           </div>
-          <h3>Loadings · {analysis.pca.components[xComponent].name}</h3>
-          <div className="analysis-loading-list">
-            {Object.entries(analysis.pca.components[xComponent].loadings)
-              .sort(([, a], [, b]) => Math.abs(b) - Math.abs(a))
-              .slice(0, 5)
-              .map(([feature, value]) => (
-                <span key={feature}>{metricLabel(feature)} <strong>{fixed(value, 2)}</strong></span>
+        </section>
+        <section className="analysis-pca-side-card analysis-pca-compact-card">
+          <h3>Dominant loadings</h3>
+          <div className="analysis-pca-loading-columns">
+            <div className="analysis-loading-list">
+              <span><strong>{analysis.pca.components[xComponent].name}</strong></span>
+              {xLoadings.map(([feature, value]) => (
+                <span key={`x-${feature}`}>{metricLabel(feature)} <strong>{fixed(value, 2)}</strong></span>
               ))}
+            </div>
+            <div className="analysis-loading-list">
+              <span><strong>{analysis.pca.components[yComponent].name}</strong></span>
+              {yLoadings.map(([feature, value]) => (
+                <span key={`y-${feature}`}>{metricLabel(feature)} <strong>{fixed(value, 2)}</strong></span>
+              ))}
+            </div>
           </div>
+        </section>
+        <section className="analysis-pca-side-card analysis-pca-compact-card">
           <h3>Cluster size</h3>
           <div className="analysis-cluster-list">
             {Object.entries(clusterSizes).map(([cluster, count]) => (
-              <span key={cluster}>{cluster}<strong>{count.toLocaleString()}</strong></span>
+              <button
+                key={cluster}
+                type="button"
+                className="analysis-cluster-chip"
+                onClick={() => {
+                  const clusterIndex = Number(cluster.replace("C", "")) - 1;
+                  const ids = clusterResult.idsByCluster.get(clusterIndex) ?? [];
+                  if (ids.length > 0) previewIds(ids, `Cluster ${clusterIndex + 1}`);
+                }}
+              >
+                <span>{cluster}</span>
+                <strong>{count.toLocaleString()}</strong>
+              </button>
             ))}
           </div>
-        </aside>
+        </section>
+      </div>
+      <div className="analysis-control-row analysis-control-row-grid analysis-control-row-bottom">
+        <label>
+          Depth
+          <input
+            type="range"
+            min={1}
+            max={componentCount}
+            value={depth}
+            onChange={(event) => setDepth(Number(event.target.value))}
+          />
+          <strong>{depth}</strong>
+        </label>
+        <label>
+          Clusters
+          <select
+            value={String(clusterCount)}
+            onChange={(event) =>
+              setClusterCount(event.target.value === "auto" ? "auto" : Number(event.target.value))
+            }
+          >
+            <option value="auto">Auto ({effectiveClusterCount})</option>
+            {clusterOptions.map((value) => (
+              <option key={value} value={value}>{value}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Color
+          <select value={colorMode} onChange={(event) => setColorMode(event.target.value as ColorMode)}>
+            <option value="cluster">Cluster</option>
+            <option value="polarity">Polarity</option>
+            <option value="source_kind">Source</option>
+            <option value="direction">Direction</option>
+          </select>
+        </label>
+        <label>
+          X
+          <select value={xComponent} onChange={(event) => setXComponent(Number(event.target.value))}>
+            {analysis.pca.components.map((component, index) => (
+              <option key={component.name} value={index}>{component.name}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Y
+          <select value={yComponent} onChange={(event) => setYComponent(Number(event.target.value))}>
+            {analysis.pca.components.map((component, index) => (
+              <option key={component.name} value={index}>{component.name}</option>
+            ))}
+          </select>
+        </label>
       </div>
     </section>
   );
@@ -1141,6 +1921,7 @@ export function AnalysisWorkspace({ selection }: { selection: DatabaseSelectionS
   const [scatterYMetric, setScatterYMetric] = useState("logRatio");
   const [previewRequest, setPreviewRequest] = useState<PreviewRequest>(EMPTY_PREVIEW);
   const [loading, setLoading] = useState(false);
+  const [analysisStatus, setAnalysisStatus] = useState<DatabaseAnalysisStatus | null>(null);
   const [exporting, setExporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -1148,44 +1929,115 @@ export function AnalysisWorkspace({ selection }: { selection: DatabaseSelectionS
     if (selection.allFiltered || selection.selectedIds.length > 0) return selection;
     return null;
   }, [selection]);
+  const selectionRequestKey = useMemo(() => {
+    if (effectiveSelection === null) return "none";
+    return JSON.stringify({
+      allFiltered: effectiveSelection.allFiltered,
+      total: effectiveSelection.total,
+      selectedIds: effectiveSelection.selectedIds,
+      filters: effectiveSelection.filters
+    });
+  }, [effectiveSelection]);
 
   useEffect(() => {
     if (effectiveSelection === null) {
       setAnalysis(null);
       setLoading(false);
+      setAnalysisStatus(null);
       setError(null);
       setPreviewRequest(EMPTY_PREVIEW);
       return undefined;
     }
-    const controller = new AbortController();
     let active = true;
+    let timer: number | null = null;
     setLoading(true);
+    setAnalysis(null);
+    setAnalysisStatus(null);
     setError(null);
-    void analyzeDatabaseSelection(effectiveSelection, controller.signal)
-      .then((response) => {
+
+    const applyAnalysis = (response: DatabaseAnalysisResponse) => {
+      setAnalysis(response);
+      setPreviewRequest({
+        title: "Curve data preview",
+        detail: `${Math.min(response.samples.length, PREVIEW_CURVE_LIMIT)} filtered curves`,
+        ids: response.samples.slice(0, PREVIEW_CURVE_LIMIT).map((sample) => sample.curve_id)
+      });
+      setHistogramMetric((current) =>
+        response.metrics[current] ? current : Object.keys(response.metrics)[0] ?? "logRatio"
+      );
+    };
+
+    const refreshStatus = async () => {
+      const nextStatus = await getDatabaseAnalysisStatus();
+      if (!active) return;
+      setAnalysisStatus(nextStatus);
+      if (nextStatus.status === "completed") {
+        if (timer !== null) window.clearInterval(timer);
+        if (nextStatus.result) {
+          applyAnalysis(nextStatus.result);
+          setLoading(false);
+          return;
+        }
+        setError("Analysis completed without a result payload");
+        setLoading(false);
+        return;
+      }
+      if (nextStatus.status === "failed") {
+        if (timer !== null) window.clearInterval(timer);
+        setError(nextStatus.error ?? nextStatus.message ?? "Could not analyze database selection");
+        setLoading(false);
+      }
+    };
+
+    const beginPolling = () => {
+      void refreshStatus().catch((caught) => {
         if (!active) return;
-        setAnalysis(response);
-        setPreviewRequest({
-          title: "Curve data preview",
-          detail: `${Math.min(response.samples.length, PREVIEW_CURVE_LIMIT)} filtered curves`,
-          ids: response.samples.slice(0, PREVIEW_CURVE_LIMIT).map((sample) => sample.curve_id)
-        });
-        setHistogramMetric((current) =>
-          response.metrics[current] ? current : Object.keys(response.metrics)[0] ?? "logRatio"
+        setLoading(false);
+        setError(
+          caught instanceof Error ? caught.message : "Could not read analysis progress"
         );
+      });
+      timer = window.setInterval(() => {
+        void refreshStatus().catch((caught) => {
+          if (!active) return;
+          if (timer !== null) window.clearInterval(timer);
+          setLoading(false);
+          setError(
+            caught instanceof Error ? caught.message : "Could not read analysis progress"
+          );
+        });
+      }, 700);
+    };
+
+    void getDatabaseAnalysisStatus()
+      .then((currentStatus) => {
+        if (!active) return;
+        if (currentStatus.status === "running") {
+          setAnalysisStatus(currentStatus);
+          beginPolling();
+          return;
+        }
+        return startDatabaseAnalysis(effectiveSelection).then((status) => {
+          if (!active) return;
+          setAnalysisStatus(status);
+          beginPolling();
+        });
       })
       .catch((caught) => {
-        if (!active || (caught instanceof Error && caught.name === "AbortError")) return;
-        setError(caught instanceof Error ? caught.message : "Could not analyze database selection");
-      })
-      .finally(() => {
-        if (active) setLoading(false);
+        if (!active) return;
+        if (caught instanceof ApiError && caught.status === 409) {
+          beginPolling();
+          return;
+        }
+        setLoading(false);
+        setError(caught instanceof Error ? caught.message : "Could not start database analysis");
       });
+
     return () => {
       active = false;
-      controller.abort();
+      if (timer !== null) window.clearInterval(timer);
     };
-  }, [effectiveSelection]);
+  }, [selectionRequestKey]);
 
   async function exportSelection() {
     if (effectiveSelection === null) return;
@@ -1215,6 +2067,14 @@ export function AnalysisWorkspace({ selection }: { selection: DatabaseSelectionS
               ? `${effectiveSelection.total.toLocaleString()} filtered curves`
               : `${effectiveSelection.selectedIds.length.toLocaleString()} selected curves`}
           </span>
+          {analysis ? (
+            <span>
+              Based on current Database selection
+              {analysis.sample_count < analysis.count
+                ? ` · charts use ${analysis.sample_count.toLocaleString()} sampled curves`
+                : ""}
+            </span>
+          ) : null}
           {analysis && analysis.sample_count < analysis.count ? (
             <span>{analysis.sample_count.toLocaleString()} plotted samples</span>
           ) : null}
@@ -1234,8 +2094,11 @@ export function AnalysisWorkspace({ selection }: { selection: DatabaseSelectionS
           Select curves in Database before running analysis.
         </div>
       ) : null}
-      {loading && !analysis ? (
-        <div className="analysis-loading"><RefreshCw className="spin" size={24} /> Loading analysis</div>
+      {loading ? (
+        <AnalysisLoadingPanel
+          selectionCount={effectiveSelection?.allFiltered ? effectiveSelection.total : effectiveSelection?.selectedIds.length ?? 0}
+          status={analysisStatus}
+        />
       ) : null}
       {analysis ? (
         <div className="analysis-layout">
@@ -1257,7 +2120,7 @@ export function AnalysisWorkspace({ selection }: { selection: DatabaseSelectionS
             />
             <CorrelationPanel analysis={analysis} />
             <PcaExplorer analysis={analysis} onPreview={setPreviewRequest} />
-            <SelectedDataTable analysis={analysis} />
+            <CorrelationNetworkPanel analysis={analysis} />
           </div>
         </div>
       ) : null}

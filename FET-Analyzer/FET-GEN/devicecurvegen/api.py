@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import time
 import tempfile
 from datetime import datetime
 from io import BytesIO, StringIO
@@ -19,6 +20,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
 from . import __version__
+from .analysis_service import DatabaseAnalysisManager
 from .database import (
     analyze_curves,
     calendar_curves,
@@ -35,6 +37,7 @@ from .harmonize import inspect_measurement
 from .physics import generate_curves
 from .residual import ResidualEngine
 from .schemas import (
+    DatabaseAnalysisStatus,
     ExtractedFeatures,
     ExtractionRequest,
     GenerationCondition,
@@ -64,11 +67,18 @@ MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 SUPPORTED_SUFFIXES = {".csv", ".txt", ".tsv", ".dat"}
 examples_root = (Path(__file__).resolve().parents[1] / "examples").resolve()
 model_load_error: str | None = None
+_bootstrap_started_at = time.perf_counter()
+print("[startup] API bootstrap: loading residual engine", flush=True)
 try:
     residual_engine = ResidualEngine()
 except ValueError as error:
     residual_engine = ResidualEngine(discover_default=False)
     model_load_error = str(error)
+print(
+    f"[startup] API bootstrap: residual engine mode={residual_engine.mode} "
+    f"load_error={'none' if model_load_error is None else model_load_error}",
+    flush=True,
+)
 
 
 def _activate_neural_checkpoint(path: Path) -> None:
@@ -78,6 +88,24 @@ def _activate_neural_checkpoint(path: Path) -> None:
 
 
 neural_training_manager = NeuralTrainingManager(_activate_neural_checkpoint)
+database_analysis_manager = DatabaseAnalysisManager()
+
+
+@app.on_event("startup")
+def log_startup_configuration() -> None:
+    elapsed = time.perf_counter() - _bootstrap_started_at
+    print(
+        "[startup] Runtime config: "
+        f"app_mode={os.getenv('DEVICEGEN_APP_MODE', 'full')} "
+        f"database_url={os.getenv('DEVICEGEN_DATABASE_URL', 'sqlite')}",
+        flush=True,
+    )
+    print(
+        "[startup] FastAPI ready: "
+        f"version={__version__} residual_mode={residual_engine.mode} "
+        f"bootstrap_elapsed={elapsed:.2f}s",
+        flush=True,
+    )
 
 
 class DatabaseSelectionRequest(BaseModel):
@@ -251,6 +279,24 @@ def database_analyze_endpoint(request: DatabaseSelectionRequest) -> dict:
         )
     except (ValueError, SQLAlchemyError) as error:
         raise _database_error(error) from error
+
+
+@app.get("/api/database/analyze/status", response_model=DatabaseAnalysisStatus)
+def database_analysis_status() -> DatabaseAnalysisStatus:
+    return database_analysis_manager.snapshot()
+
+
+@app.post("/api/database/analyze/start", response_model=DatabaseAnalysisStatus)
+def start_database_analysis(request: DatabaseSelectionRequest) -> DatabaseAnalysisStatus:
+    selected_count = len(request.curve_ids) if request.curve_ids else 0
+    try:
+        return database_analysis_manager.start(
+            curve_ids=request.curve_ids or None,
+            filters=request.filters,
+            selected_count=selected_count,
+        )
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @app.post("/api/database/previews")

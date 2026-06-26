@@ -6,7 +6,6 @@ import {
   ChevronRight,
   Columns3,
   Database,
-  Download,
   Filter,
   RefreshCw,
   RotateCcw,
@@ -20,7 +19,6 @@ import {
   getDatabaseCurve,
   getDatabaseOptions,
   getDatabaseStatus,
-  exportDatabaseSelection,
   listDatabaseCurves
 } from "../api";
 import { DatabaseCalendarPanel } from "./DatabaseCalendarPanel";
@@ -394,6 +392,71 @@ function MetricCard({
   );
 }
 
+function InlineFilterSelect({
+  label,
+  value,
+  onChange,
+  options
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  options: Array<string | { value: string; label: string }>;
+}) {
+  return (
+    <label className="database-filter-inline">
+      <span>{label}</span>
+      <select value={value} onChange={(event) => onChange(event.target.value)}>
+        <option value="">All</option>
+        {options.map((option) => {
+          const normalized = typeof option === "string" ? { value: option, label: option } : option;
+          return <option key={normalized.value} value={normalized.value}>{normalized.label}</option>;
+        })}
+      </select>
+    </label>
+  );
+}
+
+function RangeFilterRow({
+  label,
+  minValue,
+  maxValue,
+  onMinChange,
+  onMaxChange,
+  minPlaceholder,
+  maxPlaceholder,
+  type = "text"
+}: {
+  label: string;
+  minValue: string;
+  maxValue: string;
+  onMinChange: (value: string) => void;
+  onMaxChange: (value: string) => void;
+  minPlaceholder?: string;
+  maxPlaceholder?: string;
+  type?: "text" | "date";
+}) {
+  return (
+    <div className="database-range-row">
+      <input
+        type={type}
+        inputMode={type === "text" ? "decimal" : undefined}
+        value={minValue}
+        onChange={(event) => onMinChange(event.target.value)}
+        placeholder={minPlaceholder}
+      />
+      <span>{label}</span>
+      <input
+        type={type}
+        inputMode={type === "text" ? "decimal" : undefined}
+        value={maxValue}
+        onChange={(event) => onMaxChange(event.target.value)}
+        placeholder={maxPlaceholder}
+      />
+    </div>
+  );
+}
+
 export function DatabaseWorkspace({
   selection,
   onSelectionChange
@@ -419,7 +482,6 @@ export function DatabaseWorkspace({
   const [detail, setDetail] = useState<CurveDetail | null>(null);
   const [loadingList, setLoadingList] = useState(false);
   const [loadingDetail, setLoadingDetail] = useState(false);
-  const [exporting, setExporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [browseView, setBrowseView] = useState<"list" | "calendar">("list");
   const [visibleColumns, setVisibleColumns] = useState<Set<ColumnKey>>(
@@ -522,10 +584,8 @@ export function DatabaseWorkspace({
   }, [activeCurveId]);
 
   const total = list?.total ?? 0;
-  const pageStart = total > 0 ? (list?.offset ?? 0) + 1 : 0;
-  const pageEnd = Math.min((list?.offset ?? 0) + (list?.items.length ?? 0), total);
   const canGoBack = (list?.offset ?? 0) > 0;
-  const canGoForward = pageEnd < total;
+  const canGoForward = ((list?.offset ?? 0) + (list?.items.length ?? 0)) < total;
   const pageIds = useMemo(() => (list?.items ?? []).map((curve) => curve.curve_id), [list]);
   const pageSelected = pageIds.length > 0 && pageIds.every((curveId) => selectedIds.has(curveId));
   const selectionCount = selection.allFiltered ? total : selection.selectedIds.length;
@@ -637,23 +697,6 @@ export function DatabaseWorkspace({
     });
   }
 
-  async function exportSelection() {
-    setExporting(true);
-    setError(null);
-    try {
-      await exportDatabaseSelection({
-        selectedIds: selection.allFiltered ? [] : selection.selectedIds,
-        allFiltered: selection.allFiltered,
-        filters: appliedFilters,
-        total
-      });
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Could not export selection");
-    } finally {
-      setExporting(false);
-    }
-  }
-
   function renderCell(curve: CurveSummary, key: ColumnKey) {
     switch (key) {
       case "curve":
@@ -729,7 +772,7 @@ export function DatabaseWorkspace({
               Check numeric filters: {filterErrors.join(", ")}
             </div>
           ) : null}
-          <label>
+          <label className="database-filter-search-row">
             Source text
             <div className="filter-search">
               <Search size={14} />
@@ -744,215 +787,96 @@ export function DatabaseWorkspace({
               />
             </div>
           </label>
-          <label>
-            Source kind
-            <select
+          <div className="database-filter-grid">
+            <InlineFilterSelect
+              label="Source kind"
               value={filters.source_kind ?? ""}
-              onChange={(event) =>
-                setFilters((current) =>
-                  patchFilter(current, "source_kind", event.target.value)
-                )
-              }
-            >
-              <option value="">All</option>
-              {options.source_kinds.map((kind) => (
-                <option key={kind} value={kind}>{kind}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Has Ig
-            <select
+              onChange={(value) => setFilters((current) => patchFilter(current, "source_kind", value))}
+              options={options.source_kinds}
+            />
+            <InlineFilterSelect
+              label="Has Ig"
               value={filters.has_gate_current ?? ""}
-              onChange={(event) =>
-                setFilters((current) =>
-                  patchFilter(current, "has_gate_current", event.target.value)
-                )
-              }
-            >
-              <option value="">All</option>
-              <option value="true">With Ig</option>
-              <option value="false">No Ig</option>
-            </select>
-          </label>
-          <label>
-            Polarity
-            <select
+              onChange={(value) => setFilters((current) => patchFilter(current, "has_gate_current", value))}
+              options={[
+                { value: "true", label: "With Ig" },
+                { value: "false", label: "No Ig" }
+              ]}
+            />
+            <InlineFilterSelect
+              label="Polarity"
               value={filters.polarity ?? ""}
-              onChange={(event) =>
-                setFilters((current) => patchFilter(current, "polarity", event.target.value))
-              }
-            >
-              <option value="">All</option>
-              {options.polarities.map((polarity) => (
-                <option key={polarity} value={polarity}>{polarity}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Sweep direction
-            <select
+              onChange={(value) => setFilters((current) => patchFilter(current, "polarity", value))}
+              options={options.polarities}
+            />
+            <InlineFilterSelect
+              label="Direction"
               value={filters.direction ?? ""}
-              onChange={(event) =>
-                setFilters((current) => patchFilter(current, "direction", event.target.value))
-              }
-            >
-              <option value="">All</option>
-              {options.directions.map((direction) => (
-                <option key={direction} value={direction}>{direction}</option>
-              ))}
-            </select>
-          </label>
-          <div className="filter-pair">
-            <label>
-              From
-              <input
-                type="date"
-                value={filters.date_from ?? ""}
-                onChange={(event) =>
-                  setFilters((current) => patchFilter(current, "date_from", event.target.value))
-                }
-              />
-            </label>
-            <label>
-              To
-              <input
-                type="date"
-                value={filters.date_to ?? ""}
-                onChange={(event) =>
-                  setFilters((current) => patchFilter(current, "date_to", event.target.value))
-                }
-              />
-            </label>
+              onChange={(value) => setFilters((current) => patchFilter(current, "direction", value))}
+              options={options.directions}
+            />
           </div>
-          <div className="filter-pair">
-            <label>
-              Ion min
-              <input
-                inputMode="decimal"
-                value={filters.ion_min ?? ""}
-                onChange={(event) =>
-                  setFilters((current) => patchFilter(current, "ion_min", event.target.value))
-                }
-                placeholder="1e-7"
-              />
-            </label>
-            <label>
-              Ion max
-              <input
-                inputMode="decimal"
-                value={filters.ion_max ?? ""}
-                onChange={(event) =>
-                  setFilters((current) => patchFilter(current, "ion_max", event.target.value))
-                }
-                placeholder="1e-3"
-              />
-            </label>
-          </div>
-          <div className="filter-pair">
-            <label>
-              Ioff min
-              <input
-                inputMode="decimal"
-                value={filters.ioff_min ?? ""}
-                onChange={(event) =>
-                  setFilters((current) => patchFilter(current, "ioff_min", event.target.value))
-                }
-                placeholder="1e-14"
-              />
-            </label>
-            <label>
-              Ioff max
-              <input
-                inputMode="decimal"
-                value={filters.ioff_max ?? ""}
-                onChange={(event) =>
-                  setFilters((current) => patchFilter(current, "ioff_max", event.target.value))
-                }
-                placeholder="1e-8"
-              />
-            </label>
-          </div>
-          <div className="filter-pair">
-            <label>
-              Ion/Ioff min
-              <input
-                inputMode="decimal"
-                value={filters.ion_ioff_ratio_min ?? ""}
-                onChange={(event) =>
-                  setFilters((current) =>
-                    patchFilter(current, "ion_ioff_ratio_min", event.target.value)
-                  )
-                }
-                placeholder="1e4"
-              />
-            </label>
-            <label>
-              Ion/Ioff max
-              <input
-                inputMode="decimal"
-                value={filters.ion_ioff_ratio_max ?? ""}
-                onChange={(event) =>
-                  setFilters((current) =>
-                    patchFilter(current, "ion_ioff_ratio_max", event.target.value)
-                  )
-                }
-                placeholder="1e8"
-              />
-            </label>
-          </div>
-          <div className="filter-pair">
-            <label>
-              Vth min
-              <input
-                inputMode="decimal"
-                value={filters.vth_min ?? ""}
-                onChange={(event) =>
-                  setFilters((current) => patchFilter(current, "vth_min", event.target.value))
-                }
-                placeholder="-5"
-              />
-            </label>
-            <label>
-              Vth max
-              <input
-                inputMode="decimal"
-                value={filters.vth_max ?? ""}
-                onChange={(event) =>
-                  setFilters((current) => patchFilter(current, "vth_max", event.target.value))
-                }
-                placeholder="20"
-              />
-            </label>
-          </div>
-          <div className="filter-pair">
-            <label>
-              SS min
-              <input
-                inputMode="decimal"
-                value={filters.ss_mv_dec_min ?? ""}
-                onChange={(event) =>
-                  setFilters((current) =>
-                    patchFilter(current, "ss_mv_dec_min", event.target.value)
-                  )
-                }
-                placeholder="50"
-              />
-            </label>
-            <label>
-              SS max
-              <input
-                inputMode="decimal"
-                value={filters.ss_mv_dec_max ?? ""}
-                onChange={(event) =>
-                  setFilters((current) =>
-                    patchFilter(current, "ss_mv_dec_max", event.target.value)
-                  )
-                }
-                placeholder="500"
-              />
-            </label>
-          </div>
+          <RangeFilterRow
+            label="Date range"
+            type="date"
+            minValue={filters.date_from ?? ""}
+            maxValue={filters.date_to ?? ""}
+            onMinChange={(value) => setFilters((current) => patchFilter(current, "date_from", value))}
+            onMaxChange={(value) => setFilters((current) => patchFilter(current, "date_to", value))}
+          />
+          <RangeFilterRow
+            label="Ion"
+            minValue={filters.ion_min ?? ""}
+            maxValue={filters.ion_max ?? ""}
+            onMinChange={(value) => setFilters((current) => patchFilter(current, "ion_min", value))}
+            onMaxChange={(value) => setFilters((current) => patchFilter(current, "ion_max", value))}
+            minPlaceholder="1e-7"
+            maxPlaceholder="1e-3"
+          />
+          <RangeFilterRow
+            label="Ioff"
+            minValue={filters.ioff_min ?? ""}
+            maxValue={filters.ioff_max ?? ""}
+            onMinChange={(value) => setFilters((current) => patchFilter(current, "ioff_min", value))}
+            onMaxChange={(value) => setFilters((current) => patchFilter(current, "ioff_max", value))}
+            minPlaceholder="1e-14"
+            maxPlaceholder="1e-8"
+          />
+          <RangeFilterRow
+            label="Ion/Ioff"
+            minValue={filters.ion_ioff_ratio_min ?? ""}
+            maxValue={filters.ion_ioff_ratio_max ?? ""}
+            onMinChange={(value) =>
+              setFilters((current) => patchFilter(current, "ion_ioff_ratio_min", value))
+            }
+            onMaxChange={(value) =>
+              setFilters((current) => patchFilter(current, "ion_ioff_ratio_max", value))
+            }
+            minPlaceholder="1e4"
+            maxPlaceholder="1e8"
+          />
+          <RangeFilterRow
+            label="Vth"
+            minValue={filters.vth_min ?? ""}
+            maxValue={filters.vth_max ?? ""}
+            onMinChange={(value) => setFilters((current) => patchFilter(current, "vth_min", value))}
+            onMaxChange={(value) => setFilters((current) => patchFilter(current, "vth_max", value))}
+            minPlaceholder="-5"
+            maxPlaceholder="20"
+          />
+          <RangeFilterRow
+            label="SS"
+            minValue={filters.ss_mv_dec_min ?? ""}
+            maxValue={filters.ss_mv_dec_max ?? ""}
+            onMinChange={(value) =>
+              setFilters((current) => patchFilter(current, "ss_mv_dec_min", value))
+            }
+            onMaxChange={(value) =>
+              setFilters((current) => patchFilter(current, "ss_mv_dec_max", value))
+            }
+            minPlaceholder="50"
+            maxPlaceholder="500"
+          />
           <div className="filter-actions">
             <button className="button primary" onClick={applyFiltersNow} disabled={hasFilterErrors}>
               <RefreshCw size={15} />
@@ -971,25 +895,26 @@ export function DatabaseWorkspace({
         <section className="database-results">
           <div className="database-toolbar">
             <div className="database-result-count">
-              <strong>{total.toLocaleString()}</strong> curves
-              {list && total > 0 ? <span> showing {pageStart}-{pageEnd}</span> : null}
-              {selectionCount > 0 ? <span> selected {selectionCount.toLocaleString()}</span> : null}
+              <strong>{selectionCount > 0 ? selectionCount.toLocaleString() : total.toLocaleString()}</strong>
+              <span>{selectionCount > 0 ? "selected" : "curves"}</span>
               {loadingList ? <span className="database-sync-state">Loading</span> : null}
             </div>
             <div className="database-view-toggle">
               <button
                 className={browseView === "list" ? "button secondary compact active" : "button secondary compact"}
                 onClick={() => setBrowseView("list")}
+                aria-label="List view"
+                title="List view"
               >
                 <Search size={15} />
-                List
               </button>
               <button
                 className={browseView === "calendar" ? "button secondary compact active" : "button secondary compact"}
                 onClick={() => setBrowseView("calendar")}
+                aria-label="Calendar view"
+                title="Calendar view"
               >
                 <CalendarDays size={15} />
-                Calendar
               </button>
             </div>
             <div className="database-selection-actions">
@@ -1008,14 +933,6 @@ export function DatabaseWorkspace({
               >
                 <X size={15} />
                 Clear
-              </button>
-              <button
-                className="button primary compact"
-                onClick={exportSelection}
-                disabled={selectionCount === 0 || exporting}
-              >
-                <Download size={15} />
-                {exporting ? "Exporting" : "Export"}
               </button>
             </div>
             <button

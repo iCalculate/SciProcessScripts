@@ -1,6 +1,7 @@
 import type {
   GenerationCondition,
   GenerationResponse,
+  DatabaseAnalysisStatus,
   DatabaseAnalysisResponse,
   DatabaseSelectionState,
   CurveDetail,
@@ -161,7 +162,8 @@ export async function importDatabaseSource(
 
 export async function importDatabaseFolder(
   files: File[],
-  options: DatabaseFolderImportOptions
+  options: DatabaseFolderImportOptions,
+  onUploadProgress?: (progressFraction: number) => void
 ): Promise<DatabaseImportSummary> {
   const relativePaths = files.map((file) => {
     const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
@@ -174,11 +176,42 @@ export async function importDatabaseFolder(
   body.append("max_xml_mb", String(options.max_xml_mb));
   body.append("hash_files", String(options.hash_files));
   body.append("replace", String(options.replace));
-  const response = await apiFetch("/api/database/import-upload", {
-    method: "POST",
-    body
+  if (!onUploadProgress) {
+    const response = await apiFetch("/api/database/import-upload", {
+      method: "POST",
+      body
+    });
+    return readJson<DatabaseImportSummary>(response);
+  }
+  return new Promise<DatabaseImportSummary>((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", "/api/database/import-upload");
+    request.responseType = "json";
+    request.upload.onprogress = (event) => {
+      if (!event.lengthComputable) return;
+      onUploadProgress(event.loaded / event.total);
+    };
+    request.onerror = () => {
+      reject(new ApiError("Network request failed", 0));
+    };
+    request.onload = () => {
+      const response = request.response as DatabaseImportSummary | { detail?: string } | null;
+      if (request.status >= 200 && request.status < 300) {
+        onUploadProgress(1);
+        resolve((response ?? {}) as DatabaseImportSummary);
+        return;
+      }
+      reject(
+        new ApiError(
+          response && typeof response === "object" && "detail" in response
+            ? response.detail ?? `Request failed (${request.status})`
+            : `Request failed (${request.status})`,
+          request.status
+        )
+      );
+    };
+    request.send(body);
   });
-  return readJson<DatabaseImportSummary>(response);
 }
 
 export async function getDatabaseOptions(): Promise<DatabaseOptions> {
@@ -292,6 +325,22 @@ export async function analyzeDatabaseSelection(
     signal
   });
   return readJson<DatabaseAnalysisResponse>(response);
+}
+
+export async function getDatabaseAnalysisStatus(): Promise<DatabaseAnalysisStatus> {
+  const response = await apiFetch("/api/database/analyze/status");
+  return readJson<DatabaseAnalysisStatus>(response);
+}
+
+export async function startDatabaseAnalysis(
+  selection: DatabaseSelectionState
+): Promise<DatabaseAnalysisStatus> {
+  const response = await apiFetch("/api/database/analyze/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: selectionBody(selection)
+  });
+  return readJson<DatabaseAnalysisStatus>(response);
 }
 
 export async function exportDatabaseSelection(

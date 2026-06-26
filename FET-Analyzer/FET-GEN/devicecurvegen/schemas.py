@@ -269,6 +269,30 @@ class NeuralTrainingStatus(BaseModel):
     error: str | None = None
 
 
+class DatabaseAnalysisStatus(BaseModel):
+    status: Literal["idle", "running", "completed", "failed"] = "idle"
+    stage: Literal[
+        "idle",
+        "loading_selection",
+        "building_samples",
+        "building_metrics",
+        "computing_correlations",
+        "computing_pca",
+        "finalizing",
+        "completed",
+        "failed",
+    ] = "idle"
+    job_id: str | None = None
+    message: str = "Ready to analyze"
+    started_at: str | None = None
+    completed_at: str | None = None
+    elapsed_seconds: float = 0.0
+    progress_fraction: float = 0.0
+    selected_count: int = 0
+    result: dict[str, Any] | None = None
+    error: str | None = None
+
+
 class ModelInfo(BaseModel):
     residual_mode: Literal["conditional_vae", "learned_pca", "procedural_prior"]
     model_name: str

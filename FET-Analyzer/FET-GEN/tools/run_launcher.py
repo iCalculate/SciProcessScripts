@@ -209,6 +209,10 @@ def wait_for_port(port: int, timeout: float) -> bool:
     return False
 
 
+def print_stage(message: str, style: str = "bright_blue") -> None:
+    console.print(Text(message, style=style))
+
+
 def stop_listener(port: int) -> None:
     subprocess.run(
         ["cmd.exe", "/c", f'for /f "tokens=5" %P in (\'netstat -ano ^| findstr /R /C:":{port} .*LISTENING"\') do taskkill /PID %P /F'],
@@ -347,6 +351,66 @@ def drain_process_output(
     process.stdout.close()
 
 
+def ensure_reader_thread(
+    name: str,
+    process: subprocess.Popen[str],
+    output_queue: queue.Queue[tuple[str, str]],
+    threads: dict[str, threading.Thread],
+) -> None:
+    if name in threads:
+        return
+    thread = threading.Thread(
+        target=drain_process_output,
+        args=(name, process, output_queue),
+        daemon=True,
+    )
+    thread.start()
+    threads[name] = thread
+
+
+def drain_output_queue(
+    output_queue: queue.Queue[tuple[str, str]],
+    log_buffer: deque[Text] | None = None,
+) -> None:
+    while True:
+        try:
+            source, line = output_queue.get_nowait()
+        except queue.Empty:
+            break
+        entry = format_log_line(source, line)
+        if log_buffer is not None:
+            log_buffer.append(entry)
+        console.print(entry)
+
+
+def wait_for_port_with_logs(
+    source: str,
+    port: int,
+    timeout: float,
+    output_queue: queue.Queue[tuple[str, str]],
+    log_buffer: deque[Text],
+    ready_message: str,
+) -> bool:
+    started_at = time.time()
+    last_status_tick = -1
+    while time.time() - started_at < timeout:
+        drain_output_queue(output_queue, log_buffer)
+        if port_is_open(port):
+            print_stage(f"[{PROCESS_META[source]['label']}] {ready_message}", "bright_green")
+            return True
+        elapsed = time.time() - started_at
+        status_tick = int(elapsed / 1.5)
+        if status_tick != last_status_tick:
+            last_status_tick = status_tick
+            print_stage(
+                f"[{PROCESS_META[source]['label']}] waiting for port {port} · {elapsed:0.1f}s",
+                "yellow",
+            )
+        time.sleep(0.12)
+    drain_output_queue(output_queue, log_buffer)
+    return False
+
+
 def print_runtime_header(mode: dict[str, object], selected: set[str]) -> None:
     clear_screen()
     console.print(Panel(Text("FET-GEN Running", style="bold bright_green"), border_style="bright_green"))
@@ -385,30 +449,16 @@ def print_runtime_header(mode: dict[str, object], selected: set[str]) -> None:
     console.print()
 
 
-def monitor_processes(mode: dict[str, object], selected: set[str], processes: dict[str, subprocess.Popen[str]]) -> None:
-    output_queue: queue.Queue[tuple[str, str]] = queue.Queue()
-    log_buffer: deque[Text] = deque(maxlen=LOG_LIMIT)
-    threads: list[threading.Thread] = []
-
-    for source, process in processes.items():
-        thread = threading.Thread(
-            target=drain_process_output,
-            args=(source, process, output_queue),
-            daemon=True,
-        )
-        thread.start()
-        threads.append(thread)
-
-    print_runtime_header(mode, selected)
+def monitor_processes(
+    mode: dict[str, object],
+    selected: set[str],
+    processes: dict[str, subprocess.Popen[str]],
+    output_queue: queue.Queue[tuple[str, str]],
+    log_buffer: deque[Text],
+    threads: dict[str, threading.Thread],
+) -> None:
     while True:
-        while True:
-            try:
-                source, line = output_queue.get_nowait()
-            except queue.Empty:
-                break
-            entry = format_log_line(source, line)
-            log_buffer.append(entry)
-            console.print(entry)
+        drain_output_queue(output_queue, log_buffer)
 
         dead = [name for name, process in processes.items() if process.poll() is not None]
         if dead:
@@ -436,7 +486,7 @@ def monitor_processes(mode: dict[str, object], selected: set[str], processes: di
         time.sleep(0.1)
 
     stop_processes(processes)
-    for thread in threads:
+    for thread in threads.values():
         thread.join(timeout=1)
     console.print("[bold]Launcher finished.[/bold]")
     console.print("[dim]Press any key to close this window.[/dim]")
@@ -460,26 +510,75 @@ def stop_processes(processes: dict[str, subprocess.Popen[str]]) -> None:
 def launch(mode: dict[str, object]) -> None:
     selected = set(mode["processes"])
     maybe_stop_existing(selected)
+    output_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+    log_buffer: deque[Text] = deque(maxlen=LOG_LIMIT)
+    threads: dict[str, threading.Thread] = {}
+
+    clear_screen()
+    console.print(Panel(Text("FET-GEN Launching", style="bold bright_cyan"), border_style="bright_blue"))
+    print_stage(f"Mode: {mode['label']}", "bold bright_white")
+    print_stage(f"Processes: {', '.join(sorted(selected))}", "dim")
+    if "db" in selected:
+        print_stage(f"Database URL: {DB_URL}", "dim")
+    if "api" in selected:
+        print_stage(f"App mode env: {mode['name']}", "dim")
+    console.print()
+
     if "api" in selected and "frontend" not in selected:
+        print_stage("[WEB] checking built frontend assets", "bright_blue")
         ensure_frontend_build()
+        print_stage("[WEB] built frontend assets ready", "bright_green")
 
     processes: dict[str, subprocess.Popen[str]] = {}
     try:
         if "db" in selected:
+            print_stage("[DB ] starting local database", "bright_blue")
             processes["db"] = start_db()
-            if not wait_for_port(DB_PORT, 12):
+            ensure_reader_thread("db", processes["db"], output_queue, threads)
+            if not wait_for_port_with_logs(
+                "db",
+                DB_PORT,
+                12,
+                output_queue,
+                log_buffer,
+                "database is online",
+            ):
                 raise SystemExit("Local database failed to start on port 3307.")
         if "api" in selected:
+            print_stage("[API] starting analyzer backend", "bright_blue")
             processes["api"] = start_api(str(mode["name"]))
-            if not wait_for_port(API_PORT, 12):
+            ensure_reader_thread("api", processes["api"], output_queue, threads)
+            if not wait_for_port_with_logs(
+                "api",
+                API_PORT,
+                12,
+                output_queue,
+                log_buffer,
+                "analyzer API is online",
+            ):
                 raise SystemExit("Analyzer API failed to start on port 8010.")
         if "frontend" in selected:
+            print_stage("[WEB] starting Vite dev server", "bright_blue")
             processes["frontend"] = start_frontend()
-            if not wait_for_port(FRONTEND_PORT, 12):
+            ensure_reader_thread("frontend", processes["frontend"], output_queue, threads)
+            if not wait_for_port_with_logs(
+                "frontend",
+                FRONTEND_PORT,
+                12,
+                output_queue,
+                log_buffer,
+                "frontend dev server is online",
+            ):
                 raise SystemExit("Frontend dev server failed to start on port 5173.")
-        monitor_processes(mode, selected, processes)
+        print_runtime_header(mode, selected)
+        if log_buffer:
+            for entry in log_buffer:
+                console.print(entry)
+        monitor_processes(mode, selected, processes, output_queue, log_buffer, threads)
     except Exception:
         stop_processes(processes)
+        for thread in threads.values():
+            thread.join(timeout=1)
         raise
 
 
