@@ -1,0 +1,53 @@
+# Python environment and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+_uv-cache/
+_uv-python/
+
+# Local database and sensitive runtime state
+.mysql/
+*.db
+*.sqlite
+*.sqlite3
+*.mdb
+*.accdb
+*.frm
+*.ibd
+*.MAD
+*.MAI
+*.pem
+*.pid
+*.log
+
+# Secrets and local machine config
+.env
+.env.*
+*.local
+secrets/
+
+# Raw or generated datasets
+data/
+rawdata/
+analysis_output/
+device_iv_plots/
+*.npz
+*.npy
+
+# Frontend build/install artifacts
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
+# Generated models, keep placeholder only
+models/*
+!models/.gitkeep
+
+# Tooling metadata
+.agents/

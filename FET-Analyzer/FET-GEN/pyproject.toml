@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "devicecurvegen"
+version = "0.1.0"
+description = "Physics-informed generative FET transfer-curve model"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "pydantic>=2.9",
+  "python-multipart>=0.0.12",
+  "scipy>=1.13",
+  "sqlalchemy>=2.0",
+  "typer>=0.12",
+  "uvicorn[standard]>=0.30",
+  "pymysql>=1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx2>=2.4",
+  "pytest>=8.3",
+  "pytest-cov>=5.0",
+  "ruff>=0.15",
+]
+
+[project.scripts]
+devicegen = "devicecurvegen.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["devicecurvegen"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
