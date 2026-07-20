@@ -13,8 +13,36 @@ from .schemas import (
 )
 
 
+ON_STATE_STEP_ONSET_LOG_OFFSET_DECADES = 4.0
+ON_STATE_STEP_ONSET_U_MULTIPLIER = 1.8
+ON_STATE_STEP_SLOPE_MULTIPLIER_BASE = 0.95
+ON_STATE_STEP_SLOPE_MULTIPLIER_AI = 0.15
+AI_BALANCE_DEADBAND = 0.08
+
+
 def _softplus(values: np.ndarray) -> np.ndarray:
     return np.logaddexp(0.0, values)
+
+
+def _smoothstep01(value: float) -> float:
+    clipped = float(np.clip(value, 0.0, 1.0))
+    return clipped * clipped * (3.0 - 2.0 * clipped)
+
+
+def _effective_ai_balance(value: float, *, deadband: float = AI_BALANCE_DEADBAND) -> float:
+    clipped = float(np.clip(value, 0.0, 1.0))
+    if clipped <= deadband:
+        return 0.0
+    normalized = (clipped - deadband) / max(1.0 - deadband, 1e-9)
+    return _smoothstep01(normalized)
+
+
+def _effective_ai_residual_strength(condition: GenerationCondition) -> float:
+    return _effective_ai_balance(condition.ai_residual_strength)
+
+
+def _effective_gate_ai_residual_strength(condition: GenerationCondition) -> float:
+    return _effective_ai_balance(condition.gate_ai_residual_strength)
 
 
 def _gate_leakage_current(
@@ -262,6 +290,12 @@ def _physics_log_current(
     return np.log10(measured_current)
 
 
+def _effective_physical_strictness(condition: GenerationCondition) -> float:
+    # Deprecated: keep the schema field for backward compatibility, but do not
+    # let it alter the generated morphology anymore.
+    return 0.0
+
+
 def _stabilize_on_state_log_current(
     voltage: np.ndarray,
     log_current: np.ndarray,
@@ -269,22 +303,43 @@ def _stabilize_on_state_log_current(
     *,
     reverse: bool,
 ) -> np.ndarray:
-    if (
-        condition.ai_residual_strength <= 0
-        or condition.physical_strictness >= 0.95
-        or log_current.size < 9
-    ):
+    ai_strength = _effective_ai_residual_strength(condition)
+    if ai_strength <= 0 or log_current.size < 9:
+        return log_current
+    stabilize_strength = float(
+        np.clip(
+            ai_strength**2
+            * (3.0 - 2.0 * ai_strength),
+            0.0,
+            1.0,
+        )
+    )
+    if stabilize_strength <= 1e-4:
         return log_current
     sign = 1.0 if condition.polarity == "n-type" else -1.0
     effective_vth = _target_transfer_vth(condition, reverse=reverse)
     u = sign * (voltage - effective_vth)
     order = np.argsort(u)
-    ordered_u = u[order]
     ordered_log = log_current[order].copy()
+    ordered_u = u[order]
     ss_v = condition.target_ss_mv_dec / 1000.0
-    onset = 1.6 * ss_v
-    blend_width = max(1.2 * ss_v, (condition.voltage_max - condition.voltage_min) * 0.015)
-    on_weight = 1.0 / (1.0 + np.exp(-np.clip((ordered_u - onset) / blend_width, -80.0, 80.0)))
+    onset = 3.0 * ss_v
+    blend_width = max(ss_v, (condition.voltage_max - condition.voltage_min) * 0.015)
+    voltage_weight = 1.0 / (
+        1.0
+        + np.exp(
+            -np.clip((ordered_u - onset) / blend_width, -80.0, 80.0)
+        )
+    )
+    log_ion = np.log10(_effective_on_current(condition))
+    on_state_start = log_ion - 3.5
+    current_weight = 1.0 / (
+        1.0
+        + np.exp(
+            -np.clip((ordered_log - on_state_start) / 0.22, -80.0, 80.0)
+        )
+    )
+    on_weight = voltage_weight * current_weight
     if np.max(on_weight) < 0.05:
         return log_current
 
@@ -293,14 +348,20 @@ def _stabilize_on_state_log_current(
         61,
     )
     smoothed = _smooth_series(ordered_log, window)
-    robust_log = (1.0 - 0.95 * on_weight) * ordered_log + 0.95 * on_weight * smoothed
+    smooth_blend = 0.95 * stabilize_strength * on_weight
+    robust_log = (1.0 - smooth_blend) * ordered_log + smooth_blend * smoothed
 
     on_region = on_weight > 0.5
     if np.count_nonzero(on_region) >= 3:
         values = robust_log[on_region]
         center = _smooth_series(values, min(max(5, int(round(values.size * 0.12)) | 1), 31))
         local_delta = np.clip(values - center, -0.025, 0.025)
-        robust_log[on_region] = center + local_delta
+        constrained = center + local_delta
+        local_blend = min(0.85, 0.85 * stabilize_strength)
+        robust_log[on_region] = (
+            (1.0 - local_blend) * values
+            + local_blend * constrained
+        )
 
     stabilized = log_current.copy()
     stabilized[order] = robust_log
@@ -315,6 +376,7 @@ def _project_residual(
     *,
     reverse: bool,
 ) -> np.ndarray:
+    ai_strength = _effective_ai_residual_strength(condition)
     sign = 1.0 if condition.polarity == "n-type" else -1.0
     effective_vth = _target_transfer_vth(condition, reverse=reverse)
     u = sign * (voltage - effective_vth)
@@ -322,7 +384,7 @@ def _project_residual(
     normalized_distance = np.abs(voltage - effective_vth) / span
 
     corrected = residual.copy()
-    strictness = condition.physical_strictness
+    strictness = _effective_physical_strictness(condition)
     residual_gate = 1.0 / (
         1.0
         + np.exp(
@@ -359,11 +421,13 @@ def _project_residual(
     corrected -= strictness * threshold_error * threshold_guard
     corrected *= 1.0 - 0.18 * strictness * normalized_distance
 
-    combined = physics_log + condition.ai_residual_strength * corrected
+    combined = physics_log + ai_strength * corrected
     log_ioff = np.log10(condition.target_ioff)
     log_ion = np.log10(_effective_on_current(condition))
     slack = 0.45 * (1.0 - strictness) + 0.05
-    combined = np.clip(combined, log_ioff, log_ion + slack)
+    lower_soft = log_ioff - 0.08 * (1.0 - strictness)
+    upper_soft = log_ion + slack
+    combined = np.clip(combined, lower_soft, upper_soft)
 
     if strictness > 0:
         order = np.argsort(u)
@@ -410,6 +474,176 @@ def _limit_on_state_drawdown(
     return constrained
 
 
+def _limit_on_state_step_jump(
+    voltage: np.ndarray,
+    log_current: np.ndarray,
+    condition: GenerationCondition,
+    *,
+    reverse: bool,
+) -> np.ndarray:
+    ai_strength = _effective_ai_residual_strength(condition)
+    if log_current.size < 4 or ai_strength <= 0:
+        return log_current
+    sign = 1.0 if condition.polarity == "n-type" else -1.0
+    effective_vth = _target_transfer_vth(condition, reverse=reverse)
+    u = sign * (voltage - effective_vth)
+    order = np.argsort(u)
+    ordered_voltage = voltage[order]
+    ordered_u = u[order]
+    ordered_log = log_current[order].copy()
+    dv = np.diff(ordered_voltage)
+    valid = np.abs(dv) > 1e-9
+    if not np.any(valid):
+        return log_current
+
+    ss_v = condition.target_ss_mv_dec / 1000.0
+    log_ion = np.log10(_effective_on_current(condition))
+    onset_log = log_ion - ON_STATE_STEP_ONSET_LOG_OFFSET_DECADES
+    onset_mask = (
+        (ordered_u[:-1] >= ON_STATE_STEP_ONSET_U_MULTIPLIER * ss_v)
+        | (ordered_log[:-1] >= onset_log)
+        | (ordered_log[1:] >= onset_log)
+    )
+    if not np.any(onset_mask):
+        return log_current
+
+    max_slope = (
+        1000.0 / max(condition.target_ss_mv_dec, 1e-6)
+    ) * (
+        ON_STATE_STEP_SLOPE_MULTIPLIER_BASE
+        + ON_STATE_STEP_SLOPE_MULTIPLIER_AI * ai_strength
+    )
+    max_step = np.abs(dv) * max_slope
+    for index in range(1, ordered_log.size):
+        if not valid[index - 1] or not onset_mask[index - 1]:
+            continue
+        allowed_top = ordered_log[index - 1] + max_step[index - 1]
+        if ordered_log[index] > allowed_top:
+            ordered_log[index] = allowed_top
+
+    constrained = log_current.copy()
+    constrained[order] = ordered_log
+    return constrained
+
+
+def _limit_threshold_jump(
+    voltage: np.ndarray,
+    log_current: np.ndarray,
+    condition: GenerationCondition,
+    *,
+    reverse: bool,
+) -> np.ndarray:
+    ai_strength = _effective_ai_residual_strength(condition)
+    if log_current.size < 4 or ai_strength <= 0:
+        return log_current
+    sign = 1.0 if condition.polarity == "n-type" else -1.0
+    effective_vth = _target_transfer_vth(condition, reverse=reverse)
+    u = sign * (voltage - effective_vth)
+    order = np.argsort(u)
+    ordered_voltage = voltage[order]
+    ordered_log = log_current[order].copy()
+    ordered_u = u[order]
+    threshold_window = max(
+        0.22,
+        3.2 * condition.target_ss_mv_dec / 1000.0,
+    )
+    region_mask = (
+        np.minimum(
+            np.abs(ordered_voltage - effective_vth),
+            np.abs(ordered_voltage - condition.target_vth),
+        )
+        <= threshold_window
+    )
+    if np.count_nonzero(region_mask) < 2:
+        return log_current
+
+    dv = np.diff(ordered_voltage)
+    valid = np.abs(dv) > 1e-9
+    if not np.any(valid):
+        return log_current
+    ss_slope = 1000.0 / max(condition.target_ss_mv_dec, 1e-6)
+    max_slope = ss_slope * (1.20 + 0.45 * ai_strength)
+    max_step = np.abs(dv) * max_slope
+    threshold_pair_mask = region_mask[1:] | region_mask[:-1]
+    clamped = ordered_log.copy()
+    for index in range(1, ordered_log.size):
+        if not valid[index - 1] or not threshold_pair_mask[index - 1]:
+            continue
+        allowed_top = clamped[index - 1] + max_step[index - 1]
+        if clamped[index] > allowed_top:
+            clamped[index] = allowed_top
+    eased = clamped.copy()
+    local_count = int(np.count_nonzero(region_mask))
+    if local_count >= 5:
+        smooth_window = min(
+            max(7, int(round(local_count * 0.30)) | 1),
+            11,
+        )
+        smoothed = _smooth_series(clamped, smooth_window)
+        smooth_blend = min(0.65, 0.18 + 0.42 * ai_strength)
+        eased[region_mask] = (
+            (1.0 - smooth_blend) * clamped[region_mask]
+            + smooth_blend * smoothed[region_mask]
+        )
+    blend = min(0.88, 0.25 + 0.60 * ai_strength)
+    eased[region_mask] = (
+        (1.0 - blend) * ordered_log[region_mask]
+        + blend * eased[region_mask]
+    )
+    constrained = log_current.copy()
+    constrained[order] = eased
+    return constrained
+
+
+def _align_threshold_vth(
+    voltage: np.ndarray,
+    log_current: np.ndarray,
+    condition: GenerationCondition,
+    *,
+    reverse: bool,
+    strength: float,
+    local_window_scale: float = 0.0,
+    local_min_window_v: float = 0.18,
+) -> np.ndarray:
+    if (
+        log_current.size < 9
+        or strength <= 0
+        or _effective_ai_residual_strength(condition) <= 0
+    ):
+        return log_current
+    current = np.power(10.0, log_current)
+    features = analyze_transfer_curve(voltage, current, polarity=condition.polarity)
+    measured_vth = features.vth
+    if measured_vth is None or not np.isfinite(measured_vth):
+        return log_current
+    target_vth = _target_transfer_vth(condition, reverse=reverse)
+    span = max(condition.voltage_max - condition.voltage_min, 1e-6)
+    shift_v = float(measured_vth) - target_vth
+    shift_v = float(np.clip(strength * shift_v, -0.35 * span, 0.35 * span))
+    if abs(shift_v) < 1e-6:
+        return log_current
+    if local_window_scale > 0:
+        local_window_v = max(
+            local_window_scale * condition.target_ss_mv_dec / 1000.0,
+            local_min_window_v,
+            0.01 * span,
+        )
+        local_envelope = np.exp(
+            -0.5 * np.square((voltage - target_vth) / max(local_window_v, 1e-6))
+        )
+        shifted_voltage = voltage + shift_v * local_envelope
+    else:
+        shifted_voltage = voltage + shift_v
+    shifted_current = np.interp(
+        shifted_voltage,
+        voltage,
+        current,
+        left=float(current[0]),
+        right=float(current[-1]),
+    )
+    return np.log10(np.clip(shifted_current, np.finfo(float).tiny, None))
+
+
 def _generate_sweep(
     voltage: np.ndarray,
     condition: GenerationCondition,
@@ -438,6 +672,18 @@ def _generate_sweep(
         condition,
         reverse=reverse,
     )
+    final_log = _limit_threshold_jump(
+        voltage,
+        final_log,
+        condition,
+        reverse=reverse,
+    )
+    final_log = _limit_on_state_step_jump(
+        voltage,
+        final_log,
+        condition,
+        reverse=reverse,
+    )
     final_log = _limit_on_state_drawdown(
         voltage,
         final_log,
@@ -448,40 +694,77 @@ def _generate_sweep(
     rng = np.random.default_rng(seed + 104729)
     log_ioff = np.log10(condition.target_ioff)
     log_ion = np.log10(_effective_on_current(condition))
-    slack = 0.45 * (1.0 - condition.physical_strictness) + 0.05
+    effective_strictness = _effective_physical_strictness(condition)
+    slack = 0.45 * (1.0 - effective_strictness) + 0.08
     lower_bound = np.log10(max(condition.target_ioff, np.finfo(float).tiny))
     final_log = np.clip(final_log, lower_bound - slack, log_ion + slack)
-    if condition.physical_strictness > 0:
+    if effective_strictness > 0:
         sign = 1.0 if condition.polarity == "n-type" else -1.0
         order = np.argsort(sign * voltage)
         ordered_log = final_log[order]
         monotonic = np.maximum.accumulate(ordered_log)
-        blend = condition.physical_strictness**2
+        blend = 0.55 * effective_strictness**2
         ordered_log = (1.0 - blend) * ordered_log + blend * monotonic
         edge_count = min(max(5, int(round(ordered_log.size * 0.10))), ordered_log.size)
         off_error = log_ioff - float(np.median(ordered_log[:edge_count]))
         on_error = log_ion - float(np.max(ordered_log[-edge_count:]))
         position = np.linspace(0.0, 1.0, ordered_log.size)
         smooth_position = position * position * (3.0 - 2.0 * position)
-        ordered_log += condition.physical_strictness * (
+        ordered_log += 0.45 * effective_strictness * (
             (1.0 - smooth_position) * off_error + smooth_position * on_error
         )
         ordered_log = (1.0 - blend) * ordered_log + blend * np.maximum.accumulate(ordered_log)
         final_log[order] = np.clip(ordered_log, lower_bound - slack, log_ion + slack)
+    final_log = _limit_threshold_jump(
+        voltage,
+        final_log,
+        condition,
+        reverse=reverse,
+    )
+    final_log = _limit_on_state_step_jump(
+        voltage,
+        final_log,
+        condition,
+        reverse=reverse,
+    )
+    vth_align_strength = float(
+        getattr(residual_engine, "hybrid_post_vth_align_strength", 0.0) or 0.0
+    )
+    reverse_only_vth_align = bool(
+        getattr(residual_engine, "hybrid_post_vth_align_reverse_only", False) or False
+    )
+    if vth_align_strength > 0 and (reverse or not reverse_only_vth_align):
+        local_window_scale = float(
+            getattr(residual_engine, "hybrid_post_vth_align_local_window_scale", 0.0) or 0.0
+        )
+        local_min_window_v = float(
+            getattr(residual_engine, "hybrid_post_vth_align_local_min_window_v", 0.18) or 0.18
+        )
+        final_log = _align_threshold_vth(
+            voltage,
+            final_log,
+            condition,
+            reverse=reverse,
+            strength=vth_align_strength,
+            local_window_scale=local_window_scale,
+            local_min_window_v=local_min_window_v,
+        )
+        final_log = np.clip(final_log, lower_bound - slack, log_ion + slack)
     final_current = np.power(10.0, final_log)
     final_current = _apply_current_domain_noise(final_current, condition, rng)
     final_current = _quantize_current(final_current, condition.quantization_step_a)
     gate_source, gate_drain = _gate_leakage_components(voltage, condition, reverse=reverse)
     gate_baseline = np.clip(gate_source + gate_drain, np.finfo(float).tiny, None)
+    gate_ai_strength = _effective_gate_ai_residual_strength(condition)
     if (
         residual_sample.gate_values is not None
-        and condition.gate_ai_residual_strength > 0
+        and gate_ai_strength > 0
     ):
         gate_log = np.log10(gate_baseline)
         gate_delta = np.clip(residual_sample.gate_values, -4.0, 4.0)
         gate_baseline = np.power(
             10.0,
-            gate_log + condition.gate_ai_residual_strength * gate_delta,
+            gate_log + gate_ai_strength * gate_delta,
         )
     gate_measured = _apply_current_domain_noise(
         gate_baseline,
@@ -857,7 +1140,7 @@ def generate_curves(
             reverse,
             variant_condition.quantization_step_a,
             variant_condition.polarity,
-            variant_condition.physical_strictness,
+            _effective_physical_strictness(variant_condition),
         )
         forward_log = _limit_on_state_drawdown(
             voltage,
@@ -906,14 +1189,14 @@ def generate_curves(
             reverse,
             variant_condition.quantization_step_a,
             variant_condition.polarity,
-            variant_condition.physical_strictness,
+            _effective_physical_strictness(variant_condition),
         )
         forward, reverse = _close_sweep_endpoints(
             forward,
             reverse,
             variant_condition.quantization_step_a,
             variant_condition.polarity,
-            variant_condition.physical_strictness,
+            _effective_physical_strictness(variant_condition),
         )
         forward_log = _stabilize_on_state_log_current(
             voltage,

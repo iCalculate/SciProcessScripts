@@ -254,10 +254,19 @@ export function ConditionPanel({
         </div>
 
         <SliderField label="Diversity" value={condition.diversity} left="Low" right="High" onChange={(diversity) => onChange({ diversity })} />
-        <SliderField label="AI residual strength" value={condition.ai_residual_strength} left="Physics" right="Learned residual" percent onChange={(ai_residual_strength) => onChange({ ai_residual_strength })} />
-        <SliderField label="Ig residual strength" value={condition.gate_ai_residual_strength} left="Analytical Ig" right="Learned Ig" percent onChange={(gate_ai_residual_strength) => onChange({ gate_ai_residual_strength })} />
-        <SliderField label="Physical strictness" value={condition.physical_strictness} left="Relaxed" right="Strict" onChange={(physical_strictness) => onChange({ physical_strictness })} />
-
+        <SliderField
+          label="Physics <-> AI balance"
+          value={condition.ai_residual_strength}
+          left="Formula-led"
+          right="Model-led"
+          percent
+          onChange={(ai_residual_strength) =>
+            onChange({
+              ai_residual_strength,
+              gate_ai_residual_strength: ai_residual_strength
+            })
+          }
+        />
         <details className="parameter-section">
           <summary>Parameters</summary>
           <div className="parameter-section-body">

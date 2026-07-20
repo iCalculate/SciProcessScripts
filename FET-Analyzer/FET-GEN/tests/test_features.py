@@ -5,11 +5,13 @@ import pytest
 
 from devicecurvegen.features import analyze_transfer_curve
 from devicecurvegen.physics import (
+    _effective_ai_balance,
     _gate_leakage_components,
     _gate_leakage_current,
     _output_noise_sigma,
     _physics_log_current,
     _quantize_current,
+    _stabilize_on_state_log_current,
     generate_curves,
 )
 from devicecurvegen.residual import ResidualSample
@@ -194,6 +196,137 @@ def test_ai_residual_is_smooth_in_large_current_region() -> None:
     slope = np.diff(on_log) / np.diff(on_voltage)
 
     assert np.quantile(np.abs(np.diff(slope)), 0.95) < 0.15
+
+
+def test_threshold_jump_limiter_softens_local_ai_spikes() -> None:
+    class StepThresholdResidual:
+        mode = "conditional_vae"
+        model_name = "step-threshold-test"
+
+        def sample(self, normalized_voltage, **_kwargs):
+            x = np.asarray(normalized_voltage)
+            values = np.where(x > -0.02, 1.8, -1.2)
+            return ResidualSample(values, self.mode, [1.8, -1.2])
+
+    condition = GenerationCondition(
+        voltage_min=-5.0,
+        voltage_max=5.0,
+        target_vth=0.0,
+        target_ss_mv_dec=230.0,
+        hysteresis_v=1.5,
+        ai_residual_strength=1.0,
+        noise_sigma_a=0.0,
+        noise_floor_a=0.0,
+        quantization_step_a=0.0,
+        gate_leakage_a=0.0,
+        ion_sigma_fraction=0.0,
+        ioff_sigma_fraction=0.0,
+        vth_sigma_v=0.0,
+        ss_sigma_fraction=0.0,
+        hysteresis_sigma_v=0.0,
+        mobility_sigma_fraction=0.0,
+        contact_resistance_sigma_fraction=0.0,
+        variants=1,
+        points=801,
+    )
+    candidate = generate_curves(condition, StepThresholdResidual()).candidates[0]
+    voltage = np.asarray(candidate.voltage)
+    log_current = np.log10(np.asarray(candidate.forward_current))
+    threshold_band = np.abs(voltage - condition.target_vth) <= 1.5
+    local_jump = np.max(np.abs(np.diff(log_current[threshold_band])))
+
+    assert local_jump < 0.5
+
+
+def test_low_ai_balance_does_not_rewrite_a_smooth_physics_curve() -> None:
+    condition = GenerationCondition(
+        voltage_min=-20.0,
+        voltage_max=20.0,
+        target_vth=0.0,
+        target_ss_mv_dec=230.0,
+        hysteresis_v=1.5,
+        ai_residual_strength=0.01,
+        noise_sigma_a=0.0,
+        noise_floor_a=0.0,
+        quantization_step_a=0.0,
+        gate_leakage_a=0.0,
+        ion_sigma_fraction=0.0,
+        ioff_sigma_fraction=0.0,
+        vth_sigma_v=0.0,
+        ss_sigma_fraction=0.0,
+        hysteresis_sigma_v=0.0,
+        mobility_sigma_fraction=0.0,
+        contact_resistance_sigma_fraction=0.0,
+        variants=1,
+        points=601,
+    )
+    voltage = np.linspace(condition.voltage_min, condition.voltage_max, condition.points)
+    baseline = _physics_log_current(voltage, condition, reverse=False)
+    stabilized = _stabilize_on_state_log_current(
+        voltage,
+        baseline,
+        condition,
+        reverse=False,
+    )
+
+    assert np.max(np.abs(stabilized - baseline)) < 0.01
+
+
+def test_low_ai_balance_has_a_deadband_before_residual_cut_in() -> None:
+    class ThresholdStepResidual:
+        mode = "conditional_vae"
+        model_name = "threshold-step-deadband-test"
+
+        def sample(self, normalized_voltage, **_kwargs):
+            x = np.asarray(normalized_voltage)
+            values = np.where(x > 0.0, 2.0, -1.5)
+            return ResidualSample(values, self.mode, [2.0, -1.5])
+
+    physics_first = GenerationCondition(
+        voltage_min=-5.0,
+        voltage_max=5.0,
+        target_vth=0.0,
+        target_ss_mv_dec=230.0,
+        hysteresis_v=1.5,
+        ai_residual_strength=0.0,
+        gate_ai_residual_strength=0.0,
+        noise_sigma_a=0.0,
+        noise_floor_a=0.0,
+        quantization_step_a=0.0,
+        gate_leakage_a=0.0,
+        ion_sigma_fraction=0.0,
+        ioff_sigma_fraction=0.0,
+        vth_sigma_v=0.0,
+        ss_sigma_fraction=0.0,
+        hysteresis_sigma_v=0.0,
+        mobility_sigma_fraction=0.0,
+        contact_resistance_sigma_fraction=0.0,
+        variants=1,
+        points=801,
+    )
+    low_ai = physics_first.model_copy(
+        update={
+            "ai_residual_strength": 0.04,
+            "gate_ai_residual_strength": 0.04,
+        }
+    )
+
+    baseline = generate_curves(physics_first, ThresholdStepResidual()).candidates[0]
+    low_balance = generate_curves(low_ai, ThresholdStepResidual()).candidates[0]
+
+    np.testing.assert_allclose(
+        np.asarray(low_balance.forward_current),
+        np.asarray(baseline.forward_current),
+        rtol=0.0,
+        atol=0.0,
+    )
+    np.testing.assert_allclose(
+        np.asarray(low_balance.reverse_current),
+        np.asarray(baseline.reverse_current),
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert _effective_ai_balance(low_ai.ai_residual_strength) == 0.0
 
 
 def test_gate_leakage_depends_on_vgs_and_vgd_fields() -> None:
@@ -471,7 +604,6 @@ def test_generation_defaults_match_relaxed_physics_first_controls() -> None:
 
     assert condition.diversity == 1.0
     assert condition.ai_residual_strength == 0.0
-    assert condition.physical_strictness == 0.0
     assert condition.target_vth == 0.0
     assert condition.vth_sigma_v == 0.20
     assert condition.target_ss_mv_dec == 230.0
@@ -678,24 +810,37 @@ def test_generation_is_deterministic_and_exposes_latent_code() -> None:
 
 
 @pytest.mark.parametrize("polarity", ["n-type", "p-type"])
-def test_strict_generation_is_positive_monotonic_and_constrained(
+def test_physical_strictness_is_ignored_for_backward_compatibility(
     polarity: str,
 ) -> None:
-    condition = GenerationCondition(
+    base = GenerationCondition(
         polarity=polarity,
         variants=2,
-        physical_strictness=1.0,
         ai_residual_strength=1.0,
         noise_sigma_a=0.0,
         noise_floor_a=0.0,
         quantization_step_a=0.0,
         gate_leakage_a=0.0,
     )
-    sign = 1 if polarity == "n-type" else -1
-    for candidate in generate_curves(condition).candidates:
-        voltage = np.asarray(candidate.voltage)
-        current = np.asarray(candidate.forward_current)
-        order = np.argsort(sign * voltage)
-        assert np.all(current > 0)
-        assert np.all(np.diff(np.log10(current[order])) >= -1e-10)
-        assert sum(item.passed for item in candidate.constraints) >= 4
+    legacy = GenerationCondition.model_validate(
+        {
+            **base.model_dump(),
+            "physical_strictness": 1.0,
+        }
+    )
+    base_candidates = generate_curves(base).candidates
+    legacy_candidates = generate_curves(legacy).candidates
+
+    assert len(base_candidates) == len(legacy_candidates)
+    assert "physical_strictness" not in legacy.model_dump()
+    for baseline, deprecated in zip(base_candidates, legacy_candidates, strict=True):
+        baseline_forward = np.asarray(baseline.forward_current)
+        deprecated_forward = np.asarray(deprecated.forward_current)
+        assert np.all(baseline_forward > 0)
+        np.testing.assert_allclose(
+            deprecated_forward,
+            baseline_forward,
+            rtol=0.0,
+            atol=0.0,
+        )
+        assert sum(item.passed for item in deprecated.constraints) >= 4

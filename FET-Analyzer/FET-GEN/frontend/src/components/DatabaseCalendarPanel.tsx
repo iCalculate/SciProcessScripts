@@ -262,6 +262,7 @@ function SelectionList({
   title,
   clusters,
   selectedIds,
+  allFilteredSelected,
   selectedCurveId,
   onSelectAll,
   onSelectCurve,
@@ -270,6 +271,7 @@ function SelectionList({
   title: string;
   clusters: TimelineCluster[];
   selectedIds: Set<string>;
+  allFilteredSelected: boolean;
   selectedCurveId: string | null;
   onSelectAll: () => void;
   onSelectCurve: (curveId: string) => void;
@@ -305,9 +307,9 @@ function SelectionList({
               type="button"
               className="database-selection-toggle"
               onClick={() => onToggleSelection(curve.curve_id)}
-              title={selectedIds.has(curve.curve_id) ? "Unselect curve" : "Select curve"}
+              title={selectedIds.has(curve.curve_id) || allFilteredSelected ? "Unselect curve" : "Select curve"}
             >
-              {selectedIds.has(curve.curve_id) ? <CheckSquare size={15} /> : <Square size={15} />}
+              {selectedIds.has(curve.curve_id) || allFilteredSelected ? <CheckSquare size={15} /> : <Square size={15} />}
             </button>
           </div>
         ))}
@@ -320,6 +322,7 @@ export function DatabaseCalendarPanel({
   filters,
   selectedCurveId,
   selectedIds,
+  allFilteredSelected = false,
   onSelectCurve,
   onSelectCurveIds,
   onToggleSelection
@@ -327,6 +330,7 @@ export function DatabaseCalendarPanel({
   filters: CurveFilters;
   selectedCurveId: string | null;
   selectedIds: Set<string>;
+  allFilteredSelected?: boolean;
   onSelectCurve: (curveId: string) => void;
   onSelectCurveIds: (curveIds: string[]) => void;
   onToggleSelection: (curveId: string) => void;
@@ -644,6 +648,7 @@ export function DatabaseCalendarPanel({
             title="Selected week range"
             clusters={activeClusters}
             selectedIds={selectedIds}
+            allFilteredSelected={allFilteredSelected}
             selectedCurveId={selectedCurveId}
             onSelectAll={selectAllActiveClusterCurves}
             onSelectCurve={onSelectCurve}
@@ -678,6 +683,7 @@ export function DatabaseCalendarPanel({
             title="Selected day range"
             clusters={activeClusters}
             selectedIds={selectedIds}
+            allFilteredSelected={allFilteredSelected}
             selectedCurveId={selectedCurveId}
             onSelectAll={selectAllActiveClusterCurves}
             onSelectCurve={onSelectCurve}

@@ -30,7 +30,15 @@ def _trial_requests(request: NeuralTrainingRequest) -> list[NeuralTrainingReques
         return [request]
     trials = [request]
     for index in range(1, request.search_trials):
-        if request.method == "latent_pca":
+        if request.method in {
+            "latent_pca",
+            "conditional_pca",
+            "threshold_conditional_pca",
+            "local_threshold_conditional_pca",
+            "aligned_local_threshold_conditional_pca",
+            "aligned_local_delta_conditional_pca",
+            "aligned_local_affine_delta_conditional_pca",
+        }:
             multipliers = (0.5, 1.5, 2.0, 0.75, 1.25, 2.5, 0.35)
             multiplier = multipliers[(index - 1) % len(multipliers)]
             trials.append(
@@ -40,6 +48,11 @@ def _trial_requests(request: NeuralTrainingRequest) -> list[NeuralTrainingReques
                             1,
                             min(64, int(round(request.pca_components * multiplier))),
                         ),
+                        "rare_curve_weight": min(
+                            10.0,
+                            request.rare_curve_weight * (1.0 + 0.12 * index),
+                        ),
+                        "beta": min(1.0, max(1e-5, request.beta * (0.8 + 0.15 * index))),
                         "seed": request.seed + index * 101,
                     }
                 )
@@ -53,6 +66,7 @@ def _trial_requests(request: NeuralTrainingRequest) -> list[NeuralTrainingReques
                 "beta": max(0.0, request.beta * 0.7),
                 "low_current_weight": min(20.0, request.low_current_weight * 1.2),
                 "subthreshold_weight": min(20.0, request.subthreshold_weight * 1.25),
+                "rare_curve_weight": min(10.0, request.rare_curve_weight * 1.18),
             },
             {
                 "latent_dim": max(4, request.latent_dim - 4),
@@ -60,6 +74,7 @@ def _trial_requests(request: NeuralTrainingRequest) -> list[NeuralTrainingReques
                 "learning_rate": min(1.0, request.learning_rate * 1.25),
                 "beta": min(1.0, request.beta * 1.5),
                 "slope_weight": min(10.0, request.slope_weight * 1.5),
+                "rare_curve_weight": max(1.0, request.rare_curve_weight * 0.92),
             },
             {
                 "latent_dim": min(64, request.latent_dim + 8),
@@ -67,6 +82,7 @@ def _trial_requests(request: NeuralTrainingRequest) -> list[NeuralTrainingReques
                 "learning_rate": max(1e-6, request.learning_rate * 0.5),
                 "beta": min(1.0, max(request.beta * 0.5, 0.001)),
                 "gate_loss_weight": min(10.0, request.gate_loss_weight * 1.5),
+                "rare_curve_weight": min(10.0, request.rare_curve_weight * 1.32),
             },
         )
         update = {
@@ -94,6 +110,7 @@ def _training_config(request: NeuralTrainingRequest) -> NeuralTrainingConfig:
         subthreshold_weight=request.subthreshold_weight,
         slope_weight=request.slope_weight,
         gate_loss_weight=request.gate_loss_weight,
+        rare_curve_weight=request.rare_curve_weight,
         pca_components=request.pca_components,
         feature_eval_limit=request.feature_eval_limit,
     )
@@ -181,7 +198,10 @@ class NeuralTrainingManager:
         project_root = Path(__file__).resolve().parents[1]
         default_output_name = (
             "residual-cvae.npz"
-            if request.method == "physics_cvae"
+            if request.method in {"physics_cvae", "aligned_local_delta_cvae"}
+            else "residual-conditional-pca.npz"
+            if request.method in {"conditional_pca", "threshold_conditional_pca", "local_threshold_conditional_pca", "aligned_local_threshold_conditional_pca"}
+            or request.method in {"aligned_local_delta_conditional_pca", "aligned_local_affine_delta_conditional_pca"}
             else "residual-pca.npz"
         )
         output = Path(

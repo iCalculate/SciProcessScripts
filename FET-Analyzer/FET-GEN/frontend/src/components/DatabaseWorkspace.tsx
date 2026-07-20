@@ -36,6 +36,8 @@ import type {
 const DEFAULT_PAGE_SIZE = 100;
 const PAGE_SIZE_OPTIONS = [50, 100, 250];
 
+export type DatabaseBrowseView = "list" | "calendar";
+
 type FilterKey = keyof CurveFilters;
 
 const NUMERIC_FILTER_KEYS: FilterKey[] = [
@@ -347,6 +349,16 @@ type ColumnKey =
   | "source"
   | "modified";
 
+export interface DatabaseWorkspaceState {
+  filters: CurveFilters;
+  appliedFilters: CurveFilters;
+  orderBy: string;
+  pageSize: number;
+  offset: number;
+  browseView: DatabaseBrowseView;
+  visibleColumns: ColumnKey[];
+}
+
 const ALL_COLUMNS: { key: ColumnKey; label: string }[] = [
   { key: "curve", label: "Curve" },
   { key: "polarity", label: "Polarity" },
@@ -374,6 +386,29 @@ const DEFAULT_VISIBLE_COLUMNS = new Set<ColumnKey>([
   "ss",
   "source"
 ]);
+
+const DEFAULT_VISIBLE_COLUMN_KEYS: ColumnKey[] = [
+  "curve",
+  "polarity",
+  "direction",
+  "ion",
+  "ioff",
+  "logRatio",
+  "ig",
+  "vth",
+  "ss",
+  "source"
+];
+
+export const DEFAULT_DATABASE_WORKSPACE_STATE: DatabaseWorkspaceState = {
+  filters: {},
+  appliedFilters: {},
+  orderBy: "modified_at_desc",
+  pageSize: DEFAULT_PAGE_SIZE,
+  offset: 0,
+  browseView: "list",
+  visibleColumns: DEFAULT_VISIBLE_COLUMN_KEYS
+};
 
 function MetricCard({
   label,
@@ -459,10 +494,14 @@ function RangeFilterRow({
 
 export function DatabaseWorkspace({
   selection,
-  onSelectionChange
+  onSelectionChange,
+  state,
+  onStateChange
 }: {
   selection: DatabaseSelectionState;
   onSelectionChange: (selection: DatabaseSelectionState) => void;
+  state: DatabaseWorkspaceState;
+  onStateChange: (state: DatabaseWorkspaceState) => void;
 }) {
   const [status, setStatus] = useState<DatabaseStatus | null>(null);
   const [options, setOptions] = useState<DatabaseOptions>({
@@ -470,11 +509,11 @@ export function DatabaseWorkspace({
     polarities: [],
     directions: []
   });
-  const [filters, setFilters] = useState<CurveFilters>({});
-  const [appliedFilters, setAppliedFilters] = useState<CurveFilters>({});
-  const [orderBy, setOrderBy] = useState("modified_at_desc");
-  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
-  const [offset, setOffset] = useState(0);
+  const [filters, setFilters] = useState<CurveFilters>(() => state.filters);
+  const [appliedFilters, setAppliedFilters] = useState<CurveFilters>(() => state.appliedFilters);
+  const [orderBy, setOrderBy] = useState(() => state.orderBy);
+  const [pageSize, setPageSize] = useState(() => state.pageSize);
+  const [offset, setOffset] = useState(() => state.offset);
   const [reloadKey, setReloadKey] = useState(0);
   const [list, setList] = useState<CurveListResponse | null>(null);
   const [selected, setSelected] = useState<CurveSummary | null>(null);
@@ -483,9 +522,9 @@ export function DatabaseWorkspace({
   const [loadingList, setLoadingList] = useState(false);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [browseView, setBrowseView] = useState<"list" | "calendar">("list");
+  const [browseView, setBrowseView] = useState<DatabaseBrowseView>(() => state.browseView);
   const [visibleColumns, setVisibleColumns] = useState<Set<ColumnKey>>(
-    () => new Set(DEFAULT_VISIBLE_COLUMNS)
+    () => new Set(state.visibleColumns.length > 0 ? state.visibleColumns : DEFAULT_VISIBLE_COLUMN_KEYS)
   );
   const [showColumnChooser, setShowColumnChooser] = useState(false);
 
@@ -508,6 +547,18 @@ export function DatabaseWorkspace({
   const selectedIds = useMemo(() => new Set(selection.selectedIds), [selection.selectedIds]);
   const visibleColumnKeys = useMemo(() => visibleColumns, [visibleColumns]);
   const activeCurveId = calendarSelectedId ?? selected?.curve_id ?? null;
+
+  useEffect(() => {
+    onStateChange({
+      filters,
+      appliedFilters,
+      orderBy,
+      pageSize,
+      offset,
+      browseView,
+      visibleColumns: [...visibleColumns]
+    });
+  }, [appliedFilters, browseView, filters, offset, onStateChange, orderBy, pageSize, visibleColumns]);
 
   useEffect(() => {
     void Promise.all([getDatabaseStatus(), getDatabaseOptions()])
@@ -587,8 +638,12 @@ export function DatabaseWorkspace({
   const canGoBack = (list?.offset ?? 0) > 0;
   const canGoForward = ((list?.offset ?? 0) + (list?.items.length ?? 0)) < total;
   const pageIds = useMemo(() => (list?.items ?? []).map((curve) => curve.curve_id), [list]);
-  const pageSelected = pageIds.length > 0 && pageIds.every((curveId) => selectedIds.has(curveId));
-  const selectionCount = selection.allFiltered ? total : selection.selectedIds.length;
+  const selectionMatchesAppliedFilters =
+    selection.allFiltered && filterFingerprint(selection.filters) === appliedFilterFingerprint;
+  const pageSelected =
+    selectionMatchesAppliedFilters ||
+    (pageIds.length > 0 && pageIds.every((curveId) => selectedIds.has(curveId)));
+  const selectionCount = selectionMatchesAppliedFilters ? total : selection.selectedIds.length;
 
   useEffect(() => {
     onSelectionChange({
@@ -665,6 +720,14 @@ export function DatabaseWorkspace({
   }
 
   function togglePageSelection() {
+    if (selectionMatchesAppliedFilters) {
+      clearSelection();
+      return;
+    }
+    if (total > pageIds.length) {
+      selectAllFiltered();
+      return;
+    }
     const next = new Set(selection.allFiltered ? [] : selection.selectedIds);
     if (pageSelected) {
       pageIds.forEach((curveId) => next.delete(curveId));
@@ -921,10 +984,10 @@ export function DatabaseWorkspace({
               <button
                 className="button secondary compact"
                 onClick={selectAllFiltered}
-                disabled={total === 0 || loadingList}
+                disabled={total === 0 || loadingList || filtersPending || hasFilterErrors}
               >
                 <CheckSquare size={15} />
-                Select filtered
+                Select all filtered
               </button>
               <button
                 className="button secondary compact"
@@ -1030,7 +1093,7 @@ export function DatabaseWorkspace({
                       <button
                         type="button"
                         onClick={togglePageSelection}
-                        aria-label={pageSelected ? "Unselect page" : "Select page"}
+                        aria-label={pageSelected ? "Clear filtered selection" : "Select all filtered"}
                       >
                         {pageSelected ? <CheckSquare size={15} /> : <Square size={15} />}
                       </button>
@@ -1064,7 +1127,7 @@ export function DatabaseWorkspace({
                           }}
                           aria-label={selectedIds.has(curve.curve_id) ? "Unselect curve" : "Select curve"}
                         >
-                          {selectedIds.has(curve.curve_id) || selection.allFiltered ? (
+                          {selectedIds.has(curve.curve_id) || selectionMatchesAppliedFilters ? (
                             <CheckSquare size={15} />
                           ) : (
                             <Square size={15} />
@@ -1099,6 +1162,7 @@ export function DatabaseWorkspace({
               filters={appliedFilters}
               selectedCurveId={activeCurveId}
               selectedIds={selectedIds}
+              allFilteredSelected={selectionMatchesAppliedFilters}
               onSelectCurve={selectCurveById}
               onSelectCurveIds={selectCurveIds}
               onToggleSelection={toggleCurveSelection}

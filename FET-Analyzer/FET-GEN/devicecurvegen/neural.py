@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -34,7 +35,13 @@ CONDITION_NAMES = (
     "voltage_center_scaled",
     "polarity_sign",
     "direction_sign",
+    "hysteresis_normalized",
+    "noise_log_sigma",
+    "log10_gm_max",
+    "log10_leakage_level",
+    "gate_present",
 )
+CONDITION_INDEX = {name: index for index, name in enumerate(CONDITION_NAMES)}
 
 
 @dataclass
@@ -64,12 +71,25 @@ class NeuralTrainingConfig:
     subthreshold_weight: float = 2.5
     slope_weight: float = 0.10
     gate_loss_weight: float = 0.5
+    rare_curve_weight: float = 1.35
     pca_components: int = 12
     feature_eval_limit: int = 512
 
     def validate(self) -> None:
-        if self.method not in {"physics_cvae", "latent_pca"}:
-            raise ValueError("method must be physics_cvae or latent_pca")
+        if self.method not in {
+            "physics_cvae",
+            "aligned_local_delta_cvae",
+            "latent_pca",
+            "conditional_pca",
+            "threshold_conditional_pca",
+            "local_threshold_conditional_pca",
+            "aligned_local_threshold_conditional_pca",
+            "aligned_local_delta_conditional_pca",
+            "aligned_local_affine_delta_conditional_pca",
+        }:
+            raise ValueError(
+                "method must be physics_cvae, aligned_local_delta_cvae, latent_pca, conditional_pca, threshold_conditional_pca, local_threshold_conditional_pca, aligned_local_threshold_conditional_pca, aligned_local_delta_conditional_pca, or aligned_local_affine_delta_conditional_pca"
+            )
         if self.latent_dim < 1:
             raise ValueError("latent_dim must be at least 1")
         if self.hidden_dim < 4:
@@ -96,10 +116,126 @@ class NeuralTrainingConfig:
             raise ValueError("slope_weight must be non-negative")
         if self.gate_loss_weight < 0:
             raise ValueError("gate_loss_weight must be non-negative")
+        if self.rare_curve_weight < 1.0:
+            raise ValueError("rare_curve_weight must be at least 1.0")
         if not 1 <= self.pca_components <= 64:
             raise ValueError("pca_components must be between 1 and 64")
         if self.feature_eval_limit < 0:
             raise ValueError("feature_eval_limit must be non-negative")
+
+
+def _finite_float(value: float | int | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if np.isfinite(numeric) else None
+
+
+def _gm_proxy(
+    ion: float,
+    ioff: float,
+    ss_mv_dec: float,
+    *,
+    mobility_cm2_vs: float | None = None,
+    contact_resistance_ohm: float | None = None,
+) -> float:
+    safe_ion = max(float(ion), np.finfo(np.float32).tiny)
+    safe_ioff = max(min(float(ioff), safe_ion), np.finfo(np.float32).tiny)
+    dynamic_current = max(safe_ion - safe_ioff, np.finfo(np.float32).tiny)
+    swing_v_dec = max(float(ss_mv_dec) / 1000.0, 1e-6)
+    gm = dynamic_current * np.log(10.0) / swing_v_dec
+    if mobility_cm2_vs is not None and np.isfinite(mobility_cm2_vs):
+        gm *= max(float(mobility_cm2_vs), 0.01) / 20.0
+    if contact_resistance_ohm is not None and np.isfinite(contact_resistance_ohm):
+        gm /= 1.0 + max(float(contact_resistance_ohm), 0.0) / 1e4
+    return max(gm, np.finfo(np.float32).tiny)
+
+
+def _noise_proxy(
+    ioff: float,
+    *,
+    noise_sigma_a: float | None = None,
+    noise_floor_a: float | None = None,
+) -> float:
+    if noise_sigma_a is None and noise_floor_a is None:
+        return 0.0
+    reference = max(float(ioff), np.finfo(np.float32).tiny)
+    total_noise = max(float(noise_sigma_a or 0.0), 0.0) + max(
+        float(noise_floor_a or 0.0),
+        0.0,
+    )
+    if total_noise <= 0:
+        return 0.0
+    return float(np.clip(0.03 * np.log10(1.0 + total_noise / reference), 0.0, 0.6))
+
+
+def _condition_feature_payload(
+    *,
+    ion: float,
+    ioff: float,
+    vth: float,
+    ss_mv_dec: float,
+    voltage_min: float,
+    voltage_max: float,
+    polarity: str,
+    direction: str,
+    hysteresis_v: float | None = None,
+    noise_log_sigma: float | None = None,
+    gm_max: float | None = None,
+    leakage_level: float | None = None,
+    has_gate_current: bool | float = False,
+    mobility_cm2_vs: float | None = None,
+    contact_resistance_ohm: float | None = None,
+    noise_sigma_a: float | None = None,
+    noise_floor_a: float | None = None,
+) -> dict[str, float]:
+    tiny = np.finfo(np.float32).tiny
+    safe_ion = max(float(ion), tiny)
+    safe_ioff = max(min(float(ioff), safe_ion), tiny)
+    span = max(float(voltage_max) - float(voltage_min), 1e-6)
+    center = 0.5 * (float(voltage_min) + float(voltage_max))
+    gm_value = _finite_float(gm_max)
+    if gm_value is None or gm_value <= 0:
+        gm_value = _gm_proxy(
+            safe_ion,
+            safe_ioff,
+            ss_mv_dec,
+            mobility_cm2_vs=mobility_cm2_vs,
+            contact_resistance_ohm=contact_resistance_ohm,
+        )
+    leakage_value = _finite_float(leakage_level)
+    if leakage_value is None or leakage_value <= 0:
+        leakage_value = safe_ioff
+    noise_value = _finite_float(noise_log_sigma)
+    if noise_value is None:
+        noise_value = _noise_proxy(
+            safe_ioff,
+            noise_sigma_a=noise_sigma_a,
+            noise_floor_a=noise_floor_a,
+        )
+    hysteresis_value = _finite_float(hysteresis_v) or 0.0
+    gate_present = 1.0 if bool(has_gate_current) else 0.0
+    return {
+        "log10_ion": np.log10(safe_ion),
+        "log10_ioff": np.log10(safe_ioff),
+        "log10_dynamic_range": np.log10(max(safe_ion / safe_ioff, 1.0)),
+        "vth_normalized": 2.0 * (float(vth) - float(voltage_min)) / span - 1.0,
+        "log10_ss_mv_dec": np.log10(max(float(ss_mv_dec), 1e-3)),
+        "log10_voltage_span": np.log10(span),
+        "voltage_center_scaled": center / max(span, 1.0),
+        "polarity_sign": 1.0 if polarity == "n-type" else -1.0,
+        "direction_sign": (
+            -1.0 if direction == "reverse" else 1.0 if direction == "forward" else 0.0
+        ),
+        "hysteresis_normalized": float(np.clip(hysteresis_value / span, 0.0, 2.5)),
+        "noise_log_sigma": float(max(noise_value, 0.0)),
+        "log10_gm_max": np.log10(max(gm_value, tiny)),
+        "log10_leakage_level": np.log10(max(leakage_value, tiny)),
+        "gate_present": gate_present,
+    }
 
 
 def condition_vector(
@@ -112,32 +248,44 @@ def condition_vector(
     voltage_max: float,
     polarity: str,
     direction: str,
+    hysteresis_v: float | None = None,
+    noise_log_sigma: float | None = None,
+    gm_max: float | None = None,
+    leakage_level: float | None = None,
+    has_gate_current: bool | float = False,
+    mobility_cm2_vs: float | None = None,
+    contact_resistance_ohm: float | None = None,
+    noise_sigma_a: float | None = None,
+    noise_floor_a: float | None = None,
+    names: tuple[str, ...] = CONDITION_NAMES,
 ) -> np.ndarray:
-    tiny = np.finfo(np.float32).tiny
-    safe_ion = max(float(ion), tiny)
-    safe_ioff = max(min(float(ioff), safe_ion), tiny)
-    span = max(float(voltage_max) - float(voltage_min), 1e-6)
-    center = 0.5 * (float(voltage_min) + float(voltage_max))
-    return np.asarray(
-        [
-            np.log10(safe_ion),
-            np.log10(safe_ioff),
-            np.log10(max(safe_ion / safe_ioff, 1.0)),
-            2.0 * (float(vth) - float(voltage_min)) / span - 1.0,
-            np.log10(max(float(ss_mv_dec), 1e-3)),
-            np.log10(span),
-            center / max(span, 1.0),
-            1.0 if polarity == "n-type" else -1.0,
-            -1.0 if direction == "reverse" else 1.0 if direction == "forward" else 0.0,
-        ],
-        dtype=np.float32,
+    payload = _condition_feature_payload(
+        ion=ion,
+        ioff=ioff,
+        vth=vth,
+        ss_mv_dec=ss_mv_dec,
+        voltage_min=voltage_min,
+        voltage_max=voltage_max,
+        polarity=polarity,
+        direction=direction,
+        hysteresis_v=hysteresis_v,
+        noise_log_sigma=noise_log_sigma,
+        gm_max=gm_max,
+        leakage_level=leakage_level,
+        has_gate_current=has_gate_current,
+        mobility_cm2_vs=mobility_cm2_vs,
+        contact_resistance_ohm=contact_resistance_ohm,
+        noise_sigma_a=noise_sigma_a,
+        noise_floor_a=noise_floor_a,
     )
+    return np.asarray([payload[name] for name in names], dtype=np.float32)
 
 
 def condition_from_generation(
     condition: GenerationCondition,
     *,
     reverse: bool,
+    names: tuple[str, ...] = CONDITION_NAMES,
 ) -> np.ndarray:
     return condition_vector(
         ion=condition.target_ion,
@@ -148,6 +296,15 @@ def condition_from_generation(
         voltage_max=condition.voltage_max,
         polarity=condition.polarity,
         direction="reverse" if reverse else "forward",
+        hysteresis_v=condition.hysteresis_v,
+        gm_max=None,
+        leakage_level=max(condition.target_ioff, condition.gate_leakage_a),
+        has_gate_current=condition.gate_leakage_a > 0,
+        mobility_cm2_vs=condition.mobility_cm2_vs,
+        contact_resistance_ohm=condition.contact_resistance_ohm,
+        noise_sigma_a=condition.noise_sigma_a,
+        noise_floor_a=condition.noise_floor_a,
+        names=names,
     )
 
 
@@ -163,6 +320,11 @@ def _conditions_from_frame(frame: pd.DataFrame) -> np.ndarray:
                 voltage_max=row.voltage_max_v,
                 polarity=row.feature_polarity,
                 direction=row.direction,
+                hysteresis_v=getattr(row, "feature_hysteresis_v", None),
+                noise_log_sigma=getattr(row, "feature_noise_log_sigma", None),
+                gm_max=getattr(row, "feature_gm_max", None),
+                leakage_level=getattr(row, "feature_leakage_level", None),
+                has_gate_current=getattr(row, "has_gate_current", False),
             )
             for row in frame.itertuples(index=False)
         ]
@@ -209,7 +371,7 @@ def load_exported_neural_dataset(path: Path) -> NeuralDataset:
         raise ValueError(
             "Dataset directory must contain aligned_curves.npz and curves.csv"
         )
-    with np.load(matrix_path) as payload:
+    with np.load(matrix_path, allow_pickle=True) as payload:
         try:
             curve_ids = np.asarray(payload["curve_id"]).astype(str)
             grid = np.asarray(payload["x_norm"], dtype=np.float32)
@@ -270,6 +432,11 @@ def load_database_neural_dataset(database_url: str | None = None) -> NeuralDatas
             curves.c.polarity.label("feature_polarity"),
             curves.c.vth.label("feature_vth"),
             curves.c.ss_mv_dec.label("feature_ss_mv_dec"),
+            curves.c.gm_max.label("feature_gm_max"),
+            curves.c.hysteresis_v.label("feature_hysteresis_v"),
+            curves.c.noise_log_sigma.label("feature_noise_log_sigma"),
+            curves.c.leakage_level.label("feature_leakage_level"),
+            curves.c.has_gate_current,
         )
         .select_from(curves.join(source_files, curves.c.source_file_id == source_files.c.id))
         .where(
@@ -504,6 +671,62 @@ def _region_masks(dataset: NeuralDataset) -> tuple[np.ndarray, np.ndarray]:
     return low_current, subthreshold
 
 
+def _quantized_feature(values: np.ndarray, bins: int = 4) -> np.ndarray:
+    finite = values[np.isfinite(values)]
+    if finite.size < 8:
+        return np.zeros(values.shape, dtype=np.int8)
+    quantiles = np.linspace(0.0, 1.0, bins + 1)[1:-1]
+    edges = np.unique(np.quantile(finite, quantiles))
+    if edges.size == 0:
+        return np.zeros(values.shape, dtype=np.int8)
+    return np.digitize(values, edges, right=False).astype(np.int8)
+
+
+def _sample_balance_weights(
+    dataset: NeuralDataset,
+    config: NeuralTrainingConfig,
+) -> tuple[np.ndarray, int]:
+    count = dataset.log_current.shape[0]
+    if count == 0 or config.rare_curve_weight <= 1.0:
+        return np.ones(count, dtype=np.float32), 0
+    conditions = dataset.conditions
+    descriptors = [
+        _quantized_feature(conditions[:, CONDITION_INDEX["log10_dynamic_range"]]),
+        _quantized_feature(conditions[:, CONDITION_INDEX["vth_normalized"]]),
+        _quantized_feature(conditions[:, CONDITION_INDEX["log10_ss_mv_dec"]]),
+        _quantized_feature(conditions[:, CONDITION_INDEX["hysteresis_normalized"]]),
+        _quantized_feature(conditions[:, CONDITION_INDEX["log10_gm_max"]]),
+    ]
+    polarity = (conditions[:, CONDITION_INDEX["polarity_sign"]] > 0).astype(np.int8)
+    direction = np.sign(conditions[:, CONDITION_INDEX["direction_sign"]]).astype(np.int8)
+    gate_present = np.rint(
+        np.clip(conditions[:, CONDITION_INDEX["gate_present"]], 0.0, 1.0)
+    ).astype(np.int8)
+    keys = [
+        (
+            int(polarity[index]),
+            int(direction[index]),
+            int(gate_present[index]),
+            *(int(feature[index]) for feature in descriptors),
+        )
+        for index in range(count)
+    ]
+    counts = Counter(keys)
+    if not counts:
+        return np.ones(count, dtype=np.float32), 0
+    max_count = max(counts.values())
+    rarity = np.asarray(
+        [np.sqrt(max_count / max(counts[key], 1)) for key in keys],
+        dtype=np.float32,
+    )
+    max_rarity = float(np.max(rarity))
+    if max_rarity <= 1.0 + 1e-6:
+        return np.ones(count, dtype=np.float32), len(counts)
+    normalized = (rarity - 1.0) / max(max_rarity - 1.0, 1e-6)
+    boosts = 1.0 + (config.rare_curve_weight - 1.0) * normalized
+    return boosts.astype(np.float32), len(counts)
+
+
 def _point_weights(dataset: NeuralDataset, config: NeuralTrainingConfig) -> np.ndarray:
     current_position = _current_position(dataset)
     x = dataset.grid[None, :]
@@ -534,6 +757,373 @@ def _point_weights(dataset: NeuralDataset, config: NeuralTrainingConfig) -> np.n
     weights = np.maximum(weights, 1e-3)
     weights /= np.maximum(weights.mean(axis=1, keepdims=True), 1e-6)
     return weights.astype(np.float32)
+
+
+def _threshold_focus_parameters(config: NeuralTrainingConfig) -> tuple[float, float, float]:
+    strength = float(
+        np.clip(
+            0.45 + 0.25 * config.subthreshold_weight + 0.35 * config.slope_weight,
+            0.6,
+            2.4,
+        )
+    )
+    window_scale = float(np.clip(2.2 + 0.3 * config.slope_weight, 1.8, 3.6))
+    min_window_v = 0.16
+    return strength, window_scale, min_window_v
+
+
+def _threshold_local_parameters(
+    config: NeuralTrainingConfig,
+) -> tuple[float, float, float]:
+    window_scale = float(
+        np.clip(
+            1.25 + 0.10 * config.subthreshold_weight + 0.20 * config.slope_weight,
+            1.2,
+            2.2,
+        )
+    )
+    min_window_v = 0.12
+    floor = 0.03
+    return window_scale, min_window_v, floor
+
+
+def _threshold_focus_envelope_from_conditions(
+    *,
+    grid: np.ndarray,
+    conditions: np.ndarray,
+    strength: float,
+    window_scale: float,
+    min_window_v: float,
+) -> np.ndarray:
+    if strength <= 0:
+        return np.ones((conditions.shape[0], grid.size), dtype=np.float32)
+    x = grid[None, :].astype(np.float32)
+    vth_normalized = conditions[:, 3:4].astype(np.float32)
+    ss_mv_dec = np.power(10.0, conditions[:, 4:5], dtype=np.float32)
+    span = np.power(10.0, conditions[:, 5:6], dtype=np.float32)
+    polarity = conditions[:, 7:8].astype(np.float32)
+    direction = np.sign(conditions[:, 8:9]).astype(np.float32)
+    hysteresis_normalized = conditions[:, 9:10].astype(np.float32)
+    effective_vth_normalized = (
+        vth_normalized - polarity * direction * hysteresis_normalized
+    )
+    window_normalized = np.maximum.reduce(
+        [
+            2.0 * window_scale * (ss_mv_dec / 1000.0) / np.maximum(span, 1e-6),
+            np.full_like(span, 2.0 * min_window_v) / np.maximum(span, 1e-6),
+            np.full_like(span, 0.015),
+        ]
+    )
+    window_normalized = np.maximum(window_normalized, 1e-3)
+    gaussian = np.exp(
+        -0.5 * np.square((x - effective_vth_normalized) / window_normalized)
+    )
+    centered = gaussian - np.mean(gaussian, axis=1, keepdims=True)
+    envelope = 1.0 + strength * centered
+    envelope = np.clip(envelope, 0.70, 1.0 + strength)
+    return envelope.astype(np.float32)
+
+
+def _threshold_local_envelope_from_conditions(
+    *,
+    grid: np.ndarray,
+    conditions: np.ndarray,
+    window_scale: float,
+    min_window_v: float,
+    floor: float,
+) -> np.ndarray:
+    x = grid[None, :].astype(np.float32)
+    vth_normalized = conditions[:, 3:4].astype(np.float32)
+    ss_mv_dec = np.power(10.0, conditions[:, 4:5], dtype=np.float32)
+    span = np.power(10.0, conditions[:, 5:6], dtype=np.float32)
+    polarity = conditions[:, 7:8].astype(np.float32)
+    direction = np.sign(conditions[:, 8:9]).astype(np.float32)
+    hysteresis_normalized = conditions[:, 9:10].astype(np.float32)
+    effective_vth_normalized = (
+        vth_normalized - polarity * direction * hysteresis_normalized
+    )
+    window_normalized = np.maximum.reduce(
+        [
+            2.0 * window_scale * (ss_mv_dec / 1000.0) / np.maximum(span, 1e-6),
+            np.full_like(span, 2.0 * min_window_v) / np.maximum(span, 1e-6),
+            np.full_like(span, 0.012),
+        ]
+    )
+    gaussian = np.exp(
+        -0.5 * np.square((x - effective_vth_normalized) / np.maximum(window_normalized, 1e-3))
+    )
+    envelope = np.clip(gaussian, floor, 1.0)
+    return envelope.astype(np.float32)
+
+
+def _effective_vth_normalized_from_conditions(conditions: np.ndarray) -> np.ndarray:
+    vth_normalized = conditions[:, 3:4].astype(np.float32)
+    polarity = conditions[:, 7:8].astype(np.float32)
+    direction = np.sign(conditions[:, 8:9]).astype(np.float32)
+    hysteresis_normalized = conditions[:, 9:10].astype(np.float32)
+    return vth_normalized - polarity * direction * hysteresis_normalized
+
+
+def _shift_rows_to_threshold_center(
+    values: np.ndarray,
+    *,
+    grid: np.ndarray,
+    offsets: np.ndarray,
+) -> np.ndarray:
+    x = np.asarray(grid, dtype=np.float32)
+    shifted = np.empty_like(values, dtype=np.float32)
+    for index in range(values.shape[0]):
+        row = np.asarray(values[index], dtype=np.float32)
+        shifted[index] = np.interp(
+            x + float(offsets[index, 0]),
+            x,
+            row,
+            left=float(row[0]),
+            right=float(row[-1]),
+        )
+    return shifted
+
+
+def _restore_shifted_threshold_rows(
+    values: np.ndarray,
+    *,
+    grid: np.ndarray,
+    offsets: np.ndarray,
+) -> np.ndarray:
+    x = np.asarray(grid, dtype=np.float32)
+    restored = np.empty_like(values, dtype=np.float32)
+    for index in range(values.shape[0]):
+        row = np.asarray(values[index], dtype=np.float32)
+        restored[index] = np.interp(
+            x - float(offsets[index, 0]),
+            x,
+            row,
+            left=float(row[0]),
+            right=float(row[-1]),
+        )
+    return restored
+
+
+def _apply_threshold_focus_transform(
+    target: np.ndarray,
+    *,
+    drain_focus: np.ndarray,
+    points: int,
+) -> np.ndarray:
+    transformed = target.copy()
+    transformed[:, :points] = transformed[:, :points] * drain_focus
+    return transformed
+
+
+def _remove_threshold_focus_transform(
+    target: np.ndarray,
+    *,
+    drain_focus: np.ndarray,
+    points: int,
+) -> np.ndarray:
+    restored = target.copy()
+    restored[:, :points] = restored[:, :points] / np.maximum(drain_focus, 1e-6)
+    return restored
+
+
+def _apply_threshold_local_transform(
+    target: np.ndarray,
+    *,
+    drain_focus: np.ndarray,
+    points: int,
+) -> np.ndarray:
+    transformed = target.copy()
+    transformed[:, :points] = transformed[:, :points] * drain_focus
+    return transformed
+
+
+def _apply_threshold_local_aligned_transform(
+    target: np.ndarray,
+    *,
+    drain_focus: np.ndarray,
+    grid: np.ndarray,
+    conditions: np.ndarray,
+    points: int,
+) -> np.ndarray:
+    transformed = target.copy()
+    local_drain = transformed[:, :points] * drain_focus
+    transformed[:, :points] = _shift_rows_to_threshold_center(
+        local_drain,
+        grid=grid,
+        offsets=_effective_vth_normalized_from_conditions(conditions),
+    )
+    return transformed
+
+
+def _aligned_threshold_local_weights(
+    *,
+    drain_focus: np.ndarray,
+    grid: np.ndarray,
+    conditions: np.ndarray,
+) -> np.ndarray:
+    return _shift_rows_to_threshold_center(
+        drain_focus,
+        grid=grid,
+        offsets=_effective_vth_normalized_from_conditions(conditions),
+    )
+
+
+def _encode_drain_delta_rows(values: np.ndarray) -> np.ndarray:
+    encoded = np.empty_like(values, dtype=np.float32)
+    encoded[:, :1] = values[:, :1]
+    encoded[:, 1:] = np.diff(values, axis=1)
+    return encoded
+
+
+def _decode_drain_delta_rows(values: np.ndarray) -> np.ndarray:
+    return np.cumsum(values, axis=1, dtype=np.float32)
+
+
+def _apply_threshold_local_aligned_delta_transform(
+    target: np.ndarray,
+    *,
+    drain_focus: np.ndarray,
+    grid: np.ndarray,
+    conditions: np.ndarray,
+    points: int,
+) -> np.ndarray:
+    transformed = target.copy()
+    local_drain = transformed[:, :points] * drain_focus
+    aligned = _shift_rows_to_threshold_center(
+        local_drain,
+        grid=grid,
+        offsets=_effective_vth_normalized_from_conditions(conditions),
+    )
+    transformed[:, :points] = _encode_drain_delta_rows(aligned)
+    return transformed
+
+
+def _fit_weighted_affine_rows(
+    values: np.ndarray,
+    weights: np.ndarray,
+    *,
+    grid: np.ndarray,
+) -> np.ndarray:
+    x = grid[None, :].astype(np.float64)
+    w = np.maximum(weights.astype(np.float64), 1e-6)
+    y = values.astype(np.float64)
+    total = np.maximum(np.sum(w, axis=1, keepdims=True), 1e-9)
+    x_mean = np.sum(w * x, axis=1, keepdims=True) / total
+    y_mean = np.sum(w * y, axis=1, keepdims=True) / total
+    centered_x = x - x_mean
+    denominator = np.maximum(np.sum(w * centered_x * centered_x, axis=1, keepdims=True), 1e-9)
+    slope = np.sum(w * centered_x * (y - y_mean), axis=1, keepdims=True) / denominator
+    intercept = np.sum(w * (y - slope * x), axis=1, keepdims=True) / total
+    return np.concatenate([intercept, slope], axis=1).astype(np.float32)
+
+
+def _apply_affine_component_to_aligned_rows(
+    values: np.ndarray,
+    *,
+    affine_params: np.ndarray,
+    aligned_weights: np.ndarray,
+    grid: np.ndarray,
+) -> np.ndarray:
+    x = grid[None, :].astype(np.float32)
+    intercept = affine_params[:, :1].astype(np.float32)
+    slope = affine_params[:, 1:2].astype(np.float32)
+    affine_component = intercept + slope * x
+    return (values + affine_component * aligned_weights.astype(np.float32)).astype(
+        np.float32
+    )
+
+
+def _apply_threshold_local_aligned_affine_delta_transform(
+    target: np.ndarray,
+    *,
+    drain_focus: np.ndarray,
+    grid: np.ndarray,
+    conditions: np.ndarray,
+    points: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    transformed = target.copy()
+    local_drain = transformed[:, :points] * drain_focus
+    aligned = _shift_rows_to_threshold_center(
+        local_drain,
+        grid=grid,
+        offsets=_effective_vth_normalized_from_conditions(conditions),
+    )
+    aligned_weights = _aligned_threshold_local_weights(
+        drain_focus=drain_focus,
+        grid=grid,
+        conditions=conditions,
+    )
+    affine_params = _fit_weighted_affine_rows(
+        aligned,
+        aligned_weights,
+        grid=grid,
+    )
+    detrended = _apply_affine_component_to_aligned_rows(
+        aligned,
+        affine_params=-affine_params,
+        aligned_weights=aligned_weights,
+        grid=grid,
+    )
+    transformed[:, :points] = _encode_drain_delta_rows(detrended)
+    return transformed, affine_params
+
+
+def _remove_threshold_local_aligned_transform(
+    target: np.ndarray,
+    *,
+    grid: np.ndarray,
+    conditions: np.ndarray,
+    points: int,
+) -> np.ndarray:
+    restored = target.copy()
+    restored[:, :points] = _restore_shifted_threshold_rows(
+        restored[:, :points],
+        grid=grid,
+        offsets=_effective_vth_normalized_from_conditions(conditions),
+    )
+    return restored
+
+
+def _remove_threshold_local_aligned_delta_transform(
+    target: np.ndarray,
+    *,
+    grid: np.ndarray,
+    conditions: np.ndarray,
+    points: int,
+) -> np.ndarray:
+    restored = target.copy()
+    decoded = _decode_drain_delta_rows(restored[:, :points])
+    restored[:, :points] = _restore_shifted_threshold_rows(
+        decoded,
+        grid=grid,
+        offsets=_effective_vth_normalized_from_conditions(conditions),
+    )
+    return restored
+
+
+def _remove_threshold_local_aligned_affine_delta_transform(
+    target: np.ndarray,
+    *,
+    grid: np.ndarray,
+    conditions: np.ndarray,
+    aligned_weights: np.ndarray,
+    affine_params: np.ndarray,
+    points: int,
+) -> np.ndarray:
+    restored = target.copy()
+    decoded = _decode_drain_delta_rows(restored[:, :points])
+    retrended = _apply_affine_component_to_aligned_rows(
+        decoded,
+        affine_params=affine_params,
+        aligned_weights=aligned_weights,
+        grid=grid,
+    )
+    restored[:, :points] = _restore_shifted_threshold_rows(
+        retrended,
+        grid=grid,
+        offsets=_effective_vth_normalized_from_conditions(conditions),
+    )
+    return restored
 
 
 def _gate_row_mask(dataset: NeuralDataset) -> np.ndarray:
@@ -572,15 +1162,25 @@ def _training_weights(
     config: NeuralTrainingConfig,
     drain_weights: np.ndarray,
     channels: int,
+    sample_weights: np.ndarray | None = None,
 ) -> np.ndarray:
+    effective_drain = drain_weights
+    if sample_weights is not None:
+        effective_drain = drain_weights * sample_weights[:, None]
     if channels == 1:
-        return drain_weights
+        return effective_drain.astype(np.float32)
     gate_rows = _gate_row_mask(dataset).astype(np.float32)[:, None]
     gate_weights = np.broadcast_to(
-        gate_rows * np.float32(config.gate_loss_weight),
+        gate_rows
+        * np.float32(config.gate_loss_weight)
+        * (
+            np.ones((dataset.log_current.shape[0], 1), dtype=np.float32)
+            if sample_weights is None
+            else sample_weights[:, None].astype(np.float32)
+        ),
         drain_weights.shape,
     )
-    return np.concatenate([drain_weights, gate_weights], axis=1).astype(np.float32)
+    return np.concatenate([effective_drain, gate_weights], axis=1).astype(np.float32)
 
 
 def _rmse(values: np.ndarray, mask: np.ndarray | None = None) -> float | None:
@@ -604,6 +1204,41 @@ def _weighted_rmse(values: np.ndarray, weights: np.ndarray) -> float | None:
     if not np.any(valid):
         return None
     return float(np.sqrt(np.sum(weights[valid] * values[valid] ** 2) / np.sum(weights[valid])))
+
+
+def _selection_score(
+    *,
+    validation_rmse: float,
+    weighted_rmse: float | None,
+    low_rmse: float | None,
+    subthreshold_rmse: float | None,
+    slope_rmse: float | None,
+    gate_rmse: float | None,
+    feature_statistics: dict[str, float | int | None],
+    gate_loss_weight: float,
+) -> float:
+    score = float(weighted_rmse if weighted_rmse is not None else validation_rmse)
+    if low_rmse is not None:
+        score += 0.18 * float(low_rmse)
+    if subthreshold_rmse is not None:
+        score += 0.18 * float(subthreshold_rmse)
+    if slope_rmse is not None:
+        score += 0.05 * float(slope_rmse)
+    vth_mae = feature_statistics.get("feature_vth_mae_v")
+    if vth_mae is not None:
+        score += 0.12 * float(vth_mae)
+    ss_mae = feature_statistics.get("feature_ss_mae_mv_dec")
+    if ss_mae is not None:
+        score += 0.0010 * float(ss_mae)
+    ion_mae = feature_statistics.get("feature_log_ion_mae_decades")
+    if ion_mae is not None:
+        score += 0.20 * float(ion_mae)
+    ioff_mae = feature_statistics.get("feature_log_ioff_mae_decades")
+    if ioff_mae is not None:
+        score += 0.24 * float(ioff_mae)
+    if gate_rmse is not None:
+        score += 0.35 * gate_loss_weight * float(gate_rmse)
+    return score
 
 
 def _xavier(
@@ -633,6 +1268,7 @@ def _initialize_parameters(
         "logvar_b": np.zeros(latent_dim, dtype=np.float32),
         "decoder_w": _xavier(rng, decoder_input, hidden_dim),
         "decoder_b": np.zeros(hidden_dim, dtype=np.float32),
+        "skip_w": np.zeros((decoder_input, points), dtype=np.float32),
         "output_w": _xavier(rng, hidden_dim, points),
         "output_b": np.zeros(points, dtype=np.float32),
     }
@@ -662,7 +1298,11 @@ def _forward(
     decoder_hidden = np.tanh(
         decoder_input @ parameters["decoder_w"] + parameters["decoder_b"]
     )
-    prediction = decoder_hidden @ parameters["output_w"] + parameters["output_b"]
+    prediction = (
+        decoder_hidden @ parameters["output_w"]
+        + decoder_input @ parameters["skip_w"]
+        + parameters["output_b"]
+    )
     return {
         "encoder_input": encoder_input,
         "encoder_hidden": encoder_hidden,
@@ -788,7 +1428,11 @@ def _gradients(
     )
     gradients["decoder_w"] = forward["decoder_input"].T @ decoder_activation_gradient
     gradients["decoder_b"] = decoder_activation_gradient.sum(axis=0)
-    decoder_input_gradient = decoder_activation_gradient @ parameters["decoder_w"].T
+    gradients["skip_w"] = forward["decoder_input"].T @ prediction_gradient
+    decoder_input_gradient = (
+        decoder_activation_gradient @ parameters["decoder_w"].T
+        + prediction_gradient @ parameters["skip_w"].T
+    )
     latent_gradient = decoder_input_gradient[:, :latent_dim]
 
     mu_gradient = latent_gradient + beta * forward["mu"] / (batch_size * latent_dim)
@@ -936,6 +1580,34 @@ def _predict_raw_residual(
     return predicted
 
 
+def _latent_posterior_statistics(
+    parameters: dict[str, np.ndarray],
+    residual: np.ndarray,
+    conditions: np.ndarray,
+    sample_weights: np.ndarray,
+    batch_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    latent_dim = int(parameters["mu_b"].shape[0])
+    weighted_sum = np.zeros(latent_dim, dtype=np.float64)
+    weighted_second_moment = np.zeros(latent_dim, dtype=np.float64)
+    total_weight = 0.0
+    for start in range(0, residual.shape[0], batch_size):
+        stop = min(start + batch_size, residual.shape[0])
+        batch_weights = sample_weights[start:stop].astype(np.float64)
+        forward = _forward(parameters, residual[start:stop], conditions[start:stop], None)
+        posterior_mean = forward["mu"].astype(np.float64)
+        total_weight += float(np.sum(batch_weights))
+        weighted_sum += np.sum(posterior_mean * batch_weights[:, None], axis=0)
+        weighted_second_moment += np.sum(
+            np.square(posterior_mean) * batch_weights[:, None],
+            axis=0,
+        )
+    safe_total = max(total_weight, 1e-9)
+    mean = weighted_sum / safe_total
+    variance = np.maximum(weighted_second_moment / safe_total - np.square(mean), 1e-6)
+    return mean.astype(np.float32), np.sqrt(variance).astype(np.float32)
+
+
 def _feature_error_statistics(
     dataset: NeuralDataset,
     validation_indices: np.ndarray,
@@ -1028,6 +1700,7 @@ def _validation_statistics(
     subthreshold_mask: np.ndarray,
     batch_size: int,
     feature_eval_limit: int,
+    restore_predicted: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> dict[str, float | int | None]:
     predicted_residual = _predict_raw_residual(
         parameters,
@@ -1037,6 +1710,8 @@ def _validation_statistics(
         residual_scale,
         batch_size,
     )
+    if restore_predicted is not None:
+        predicted_residual = restore_predicted(predicted_residual)
     points = dataset.grid.size
     predicted_drain_residual = predicted_residual[:, :points]
     true_log_current = dataset.log_current[validation_indices]
@@ -1160,6 +1835,106 @@ def _save_pca_checkpoint(
         temporary.unlink(missing_ok=True)
 
 
+def _save_conditional_pca_checkpoint(
+    output: Path,
+    *,
+    dataset: NeuralDataset,
+    mean: np.ndarray,
+    components: np.ndarray,
+    scales: np.ndarray,
+    condition_mean: np.ndarray,
+    condition_scale: np.ndarray,
+    latent_w: np.ndarray,
+    latent_b: np.ndarray,
+    latent_noise: np.ndarray,
+    latent_clip: np.ndarray,
+    metadata: dict[str, Any],
+    affine_w: np.ndarray | None = None,
+    affine_b: np.ndarray | None = None,
+    affine_clip: np.ndarray | None = None,
+    threshold_focus_strength: float | None = None,
+    threshold_focus_window_scale: float | None = None,
+    threshold_focus_min_window_v: float | None = None,
+    threshold_local_align_window_scale: float | None = None,
+    threshold_local_align_min_window_v: float | None = None,
+    threshold_local_delta_transform: bool | None = None,
+) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.name}.{uuid4().hex}.tmp.npz")
+    try:
+        payload: dict[str, Any] = {
+            "model_type": np.asarray("conditional_pca"),
+            "format_version": np.asarray(3, dtype=np.int64),
+            "grid": dataset.grid.astype(np.float32),
+            "mean": mean.astype(np.float32),
+            "components": components.astype(np.float32),
+            "scales": scales.astype(np.float32),
+            "condition_names": np.asarray(CONDITION_NAMES),
+            "condition_mean": condition_mean.astype(np.float32),
+            "condition_scale": condition_scale.astype(np.float32),
+            "latent_w": latent_w.astype(np.float32),
+            "latent_b": latent_b.astype(np.float32),
+            "latent_noise": latent_noise.astype(np.float32),
+            "latent_clip": latent_clip.astype(np.float32),
+            "metadata_json": np.asarray(json.dumps(metadata, sort_keys=True)),
+        }
+        if threshold_focus_strength is not None:
+            payload["threshold_focus_strength"] = np.asarray(
+                threshold_focus_strength,
+                dtype=np.float32,
+            )
+        if threshold_focus_window_scale is not None:
+            payload["threshold_focus_window_scale"] = np.asarray(
+                threshold_focus_window_scale,
+                dtype=np.float32,
+            )
+        if threshold_focus_min_window_v is not None:
+            payload["threshold_focus_min_window_v"] = np.asarray(
+                threshold_focus_min_window_v,
+                dtype=np.float32,
+            )
+        if threshold_local_align_window_scale is not None:
+            payload["threshold_local_align_window_scale"] = np.asarray(
+                threshold_local_align_window_scale,
+                dtype=np.float32,
+            )
+        if threshold_local_align_min_window_v is not None:
+            payload["threshold_local_align_min_window_v"] = np.asarray(
+                threshold_local_align_min_window_v,
+                dtype=np.float32,
+            )
+        if threshold_local_delta_transform is not None:
+            payload["threshold_local_delta_transform"] = np.asarray(
+                1 if threshold_local_delta_transform else 0,
+                dtype=np.int64,
+            )
+        if affine_w is not None:
+            payload["affine_w"] = affine_w.astype(np.float32)
+        if affine_b is not None:
+            payload["affine_b"] = affine_b.astype(np.float32)
+        if affine_clip is not None:
+            payload["affine_clip"] = affine_clip.astype(np.float32)
+        np.savez_compressed(temporary, **payload)
+        os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _fit_weighted_ridge(
+    design: np.ndarray,
+    target: np.ndarray,
+    sample_weights: np.ndarray,
+    ridge_lambda: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    weighted_design = design * sample_weights[:, None]
+    penalty = np.eye(design.shape[1], dtype=np.float64)
+    penalty[-1, -1] = 0.0
+    gram = design.T @ weighted_design + ridge_lambda * penalty
+    rhs = weighted_design.T @ target
+    coefficients = np.linalg.solve(gram, rhs)
+    return coefficients[:-1], coefficients[-1]
+
+
 def _train_latent_pca_checkpoint(
     output: Path,
     *,
@@ -1168,12 +1943,19 @@ def _train_latent_pca_checkpoint(
     validation_indices: np.ndarray,
     physics: np.ndarray,
     config: NeuralTrainingConfig,
+    sample_weights: np.ndarray,
+    rare_curve_groups: int,
     progress: Callable[[dict[str, float | int | None]], None] | None,
 ) -> NeuralTrainingResult:
     target, channels = _training_target(dataset, physics)
     training_target = target[training_indices]
-    mean = training_target.mean(axis=0)
-    centered = training_target - mean
+    training_sample_weights = sample_weights[training_indices].astype(np.float64)
+    mean = np.average(training_target, axis=0, weights=training_sample_weights).astype(
+        np.float32
+    )
+    centered = (training_target - mean) * np.sqrt(training_sample_weights[:, None]).astype(
+        np.float32
+    )
     _, singular_values, vt = np.linalg.svd(centered, full_matrices=False)
     component_count = max(
         1,
@@ -1185,7 +1967,7 @@ def _train_latent_pca_checkpoint(
     )
     components = vt[:component_count]
     scales = singular_values[:component_count] / np.sqrt(
-        max(training_indices.size - 1, 1)
+        max(float(np.sum(training_sample_weights)) - 1.0, 1.0)
     )
     validation_target = target[validation_indices]
     validation_centered = validation_target - mean
@@ -1201,6 +1983,27 @@ def _train_latent_pca_checkpoint(
         drain_error,
         subthreshold_mask[validation_indices],
     )
+    predicted_log_current = physics[validation_indices] + reconstruction[:, :points]
+    voltage = _voltage_grid(dataset)[validation_indices]
+    voltage_delta = np.diff(voltage, axis=1)
+    valid_delta = np.abs(voltage_delta) > 1e-9
+    true_slope = np.divide(
+        np.diff(dataset.log_current[validation_indices], axis=1),
+        voltage_delta,
+        out=np.zeros_like(voltage_delta),
+        where=valid_delta,
+    )
+    predicted_slope = np.divide(
+        np.diff(predicted_log_current, axis=1),
+        voltage_delta,
+        out=np.zeros_like(voltage_delta),
+        where=valid_delta,
+    )
+    slope_mask = (
+        (subthreshold_mask[validation_indices][:, 1:] | subthreshold_mask[validation_indices][:, :-1])
+        & valid_delta
+    )
+    slope_rmse = _rmse(predicted_slope - true_slope, slope_mask)
     gate_rows = _gate_row_mask(dataset)
     validation_gate_rows = gate_rows[validation_indices]
     gate_rmse = None
@@ -1210,7 +2013,6 @@ def _train_latent_pca_checkpoint(
             - validation_target[validation_gate_rows, points : 2 * points]
         )
         gate_rmse = _rmse(gate_error)
-    predicted_log_current = physics[validation_indices] + reconstruction[:, :points]
     feature_statistics = _feature_error_statistics(
         dataset,
         validation_indices,
@@ -1218,13 +2020,15 @@ def _train_latent_pca_checkpoint(
         predicted_log_current,
         limit=config.feature_eval_limit,
     )
-    selection_score = float(
-        (weighted_rmse or validation_rmse)
-        + (
-            config.gate_loss_weight * float(gate_rmse)
-            if gate_rmse is not None
-            else 0.0
-        )
+    selection_score = _selection_score(
+        validation_rmse=validation_rmse,
+        weighted_rmse=weighted_rmse,
+        low_rmse=low_rmse,
+        subthreshold_rmse=subthreshold_rmse,
+        slope_rmse=slope_rmse,
+        gate_rmse=gate_rmse,
+        feature_statistics=feature_statistics,
+        gate_loss_weight=config.gate_loss_weight,
     )
     metric = {
         "epoch": 1,
@@ -1258,12 +2062,18 @@ def _train_latent_pca_checkpoint(
         "validation_weighted_rmse_decades": weighted_rmse,
         "validation_low_current_rmse_decades": low_rmse,
         "validation_subthreshold_rmse_decades": subthreshold_rmse,
+        "validation_subthreshold_slope_rmse_dec_per_v": slope_rmse,
         "validation_gate_rmse_decades": gate_rmse,
         "selection_score": selection_score,
         "best_trial": 1,
         **feature_statistics,
         "source": dataset.source,
         "seed": config.seed,
+        "condition_features": list(CONDITION_NAMES),
+        "sample_balance_strategy": (
+            "rare_curve_density_weighting" if config.rare_curve_weight > 1.0 else "uniform"
+        ),
+        "rare_curve_groups": rare_curve_groups,
         "training_config": {
             "method": config.method,
             "pca_components": config.pca_components,
@@ -1271,6 +2081,7 @@ def _train_latent_pca_checkpoint(
             "seed": config.seed,
             "max_curves": config.max_curves,
             "gate_loss_weight": config.gate_loss_weight,
+            "rare_curve_weight": config.rare_curve_weight,
             "feature_eval_limit": config.feature_eval_limit,
         },
         "training_history": [metric],
@@ -1300,6 +2111,488 @@ def _train_latent_pca_checkpoint(
         validation_weighted_rmse_decades=weighted_rmse,
         validation_low_current_rmse_decades=low_rmse,
         validation_subthreshold_rmse_decades=subthreshold_rmse,
+        validation_subthreshold_slope_rmse_dec_per_v=slope_rmse,
+        validation_gate_rmse_decades=gate_rmse,
+        feature_vth_mae_v=feature_statistics.get("feature_vth_mae_v"),
+        feature_ss_mae_mv_dec=feature_statistics.get("feature_ss_mae_mv_dec"),
+        selection_score=selection_score,
+        output=str(output.expanduser().resolve()),
+        source=dataset.source,
+        stopped_early=False,
+    )
+
+
+def _train_conditional_pca_checkpoint(
+    output: Path,
+    *,
+    dataset: NeuralDataset,
+    training_indices: np.ndarray,
+    validation_indices: np.ndarray,
+    physics: np.ndarray,
+    config: NeuralTrainingConfig,
+    sample_weights: np.ndarray,
+    rare_curve_groups: int,
+    standardized_conditions: np.ndarray,
+    condition_mean: np.ndarray,
+    condition_scale: np.ndarray,
+    progress: Callable[[dict[str, float | int | None]], None] | None,
+    threshold_focus: bool = False,
+    threshold_local_only: bool = False,
+    threshold_local_aligned: bool = False,
+    threshold_local_delta_aligned: bool = False,
+    threshold_local_affine_delta_aligned: bool = False,
+) -> NeuralTrainingResult:
+    target, channels = _training_target(dataset, physics)
+    points = dataset.grid.size
+    threshold_focus_strength = None
+    threshold_focus_window_scale = None
+    threshold_focus_min_window_v = None
+    threshold_local_window_scale = None
+    threshold_local_min_window_v = None
+    threshold_local_floor = None
+    affine_params = None
+    affine_w = None
+    affine_b = None
+    affine_clip = None
+    focused_target = target
+    focus_envelope = None
+    if threshold_focus:
+        (
+            threshold_focus_strength,
+            threshold_focus_window_scale,
+            threshold_focus_min_window_v,
+        ) = _threshold_focus_parameters(config)
+        focus_envelope = _threshold_focus_envelope_from_conditions(
+            grid=dataset.grid,
+            conditions=dataset.conditions,
+            strength=threshold_focus_strength,
+            window_scale=threshold_focus_window_scale,
+            min_window_v=threshold_focus_min_window_v,
+        )
+        focused_target = _apply_threshold_focus_transform(
+            target,
+            drain_focus=focus_envelope,
+            points=points,
+        )
+    elif threshold_local_only:
+        (
+            threshold_local_window_scale,
+            threshold_local_min_window_v,
+            threshold_local_floor,
+        ) = _threshold_local_parameters(config)
+        focus_envelope = _threshold_local_envelope_from_conditions(
+            grid=dataset.grid,
+            conditions=dataset.conditions,
+            window_scale=threshold_local_window_scale,
+            min_window_v=threshold_local_min_window_v,
+            floor=threshold_local_floor,
+        )
+        focused_target = _apply_threshold_local_transform(
+            target,
+            drain_focus=focus_envelope,
+            points=points,
+        )
+    elif threshold_local_aligned or threshold_local_delta_aligned or threshold_local_affine_delta_aligned:
+        (
+            threshold_local_window_scale,
+            threshold_local_min_window_v,
+            threshold_local_floor,
+        ) = _threshold_local_parameters(config)
+        focus_envelope = _threshold_local_envelope_from_conditions(
+            grid=dataset.grid,
+            conditions=dataset.conditions,
+            window_scale=threshold_local_window_scale,
+            min_window_v=threshold_local_min_window_v,
+            floor=threshold_local_floor,
+        )
+        if threshold_local_affine_delta_aligned:
+            focused_target, affine_params = _apply_threshold_local_aligned_affine_delta_transform(
+                target,
+                drain_focus=focus_envelope,
+                grid=dataset.grid,
+                conditions=dataset.conditions,
+                points=points,
+            )
+        elif threshold_local_delta_aligned:
+            focused_target = _apply_threshold_local_aligned_delta_transform(
+                target,
+                drain_focus=focus_envelope,
+                grid=dataset.grid,
+                conditions=dataset.conditions,
+                points=points,
+            )
+        else:
+            focused_target = _apply_threshold_local_aligned_transform(
+                target,
+                drain_focus=focus_envelope,
+                grid=dataset.grid,
+                conditions=dataset.conditions,
+                points=points,
+            )
+    training_target = focused_target[training_indices]
+    training_sample_weights = sample_weights[training_indices].astype(np.float64)
+    mean = np.average(training_target, axis=0, weights=training_sample_weights).astype(
+        np.float32
+    )
+    centered = (training_target - mean) * np.sqrt(training_sample_weights[:, None]).astype(
+        np.float32
+    )
+    _, singular_values, vt = np.linalg.svd(centered, full_matrices=False)
+    component_count = max(
+        1,
+        min(
+            config.pca_components,
+            vt.shape[0],
+            max(training_indices.size - 1, 1),
+        ),
+    )
+    components = vt[:component_count]
+    scales = singular_values[:component_count] / np.sqrt(
+        max(float(np.sum(training_sample_weights)) - 1.0, 1.0)
+    )
+    safe_scales = np.maximum(scales, 1e-4)
+    latent_train = ((training_target - mean) @ components.T) / safe_scales
+    design_train = np.concatenate(
+        [
+            standardized_conditions[training_indices].astype(np.float64),
+            np.ones((training_indices.size, 1), dtype=np.float64),
+        ],
+        axis=1,
+    )
+    ridge_lambda = max(float(config.beta), 1e-4)
+    latent_w, latent_b = _fit_weighted_ridge(
+        design_train,
+        latent_train.astype(np.float64),
+        training_sample_weights.astype(np.float64),
+        ridge_lambda,
+    )
+    predicted_train = (
+        standardized_conditions[training_indices].astype(np.float64) @ latent_w
+        + latent_b
+    )
+    latent_residual = latent_train.astype(np.float64) - predicted_train
+    latent_noise = np.sqrt(
+        np.average(
+            latent_residual * latent_residual,
+            axis=0,
+            weights=training_sample_weights,
+        )
+    ).astype(np.float32)
+    latent_noise = np.maximum(latent_noise, 0.05)
+    latent_clip = np.percentile(np.abs(latent_train), 99.0, axis=0).astype(np.float32)
+    latent_clip = np.clip(latent_clip, 1.0, 4.0)
+    predicted_train = np.clip(predicted_train, -latent_clip, latent_clip)
+    if threshold_local_affine_delta_aligned and affine_params is not None:
+        affine_w, affine_b = _fit_weighted_ridge(
+            design_train,
+            affine_params[training_indices].astype(np.float64),
+            training_sample_weights.astype(np.float64),
+            ridge_lambda,
+        )
+        affine_clip = np.percentile(
+            np.abs(affine_params[training_indices]),
+            99.0,
+            axis=0,
+        ).astype(np.float32)
+        affine_clip = np.maximum(affine_clip, np.asarray([0.01, 0.01], dtype=np.float32))
+
+    validation_target = target[validation_indices]
+    predicted_latent = (
+        standardized_conditions[validation_indices].astype(np.float64) @ latent_w
+        + latent_b
+    )
+    predicted_latent = np.clip(predicted_latent, -latent_clip, latent_clip)
+    reconstruction = mean + (predicted_latent * safe_scales) @ components
+    if threshold_focus and focus_envelope is not None:
+        reconstruction = _remove_threshold_focus_transform(
+            reconstruction,
+            drain_focus=focus_envelope[validation_indices],
+            points=points,
+        )
+    elif threshold_local_affine_delta_aligned and affine_w is not None and affine_b is not None:
+        predicted_affine = (
+            standardized_conditions[validation_indices].astype(np.float64) @ affine_w
+            + affine_b
+        ).astype(np.float32)
+        if affine_clip is not None:
+            predicted_affine = np.clip(predicted_affine, -affine_clip, affine_clip)
+        reconstruction = _remove_threshold_local_aligned_affine_delta_transform(
+            reconstruction,
+            grid=dataset.grid,
+            conditions=dataset.conditions[validation_indices],
+            aligned_weights=_aligned_threshold_local_weights(
+                drain_focus=focus_envelope[validation_indices],
+                grid=dataset.grid,
+                conditions=dataset.conditions[validation_indices],
+            ),
+            affine_params=predicted_affine,
+            points=points,
+        )
+    elif threshold_local_delta_aligned:
+        reconstruction = _remove_threshold_local_aligned_delta_transform(
+            reconstruction,
+            grid=dataset.grid,
+            conditions=dataset.conditions[validation_indices],
+            points=points,
+        )
+    elif threshold_local_aligned:
+        reconstruction = _remove_threshold_local_aligned_transform(
+            reconstruction,
+            grid=dataset.grid,
+            conditions=dataset.conditions[validation_indices],
+            points=points,
+        )
+    drain_error = reconstruction[:, :points] - validation_target[:, :points]
+    drain_weights = _point_weights(dataset, config)[validation_indices]
+    low_current_mask, subthreshold_mask = _region_masks(dataset)
+    validation_rmse = float(_rmse(drain_error) or 0.0)
+    weighted_rmse = _weighted_rmse(drain_error, drain_weights)
+    low_rmse = _rmse(drain_error, low_current_mask[validation_indices])
+    subthreshold_rmse = _rmse(
+        drain_error,
+        subthreshold_mask[validation_indices],
+    )
+    predicted_log_current = physics[validation_indices] + reconstruction[:, :points]
+    voltage = _voltage_grid(dataset)[validation_indices]
+    voltage_delta = np.diff(voltage, axis=1)
+    valid_delta = np.abs(voltage_delta) > 1e-9
+    true_slope = np.divide(
+        np.diff(dataset.log_current[validation_indices], axis=1),
+        voltage_delta,
+        out=np.zeros_like(voltage_delta),
+        where=valid_delta,
+    )
+    predicted_slope = np.divide(
+        np.diff(predicted_log_current, axis=1),
+        voltage_delta,
+        out=np.zeros_like(voltage_delta),
+        where=valid_delta,
+    )
+    slope_mask = (
+        (subthreshold_mask[validation_indices][:, 1:] | subthreshold_mask[validation_indices][:, :-1])
+        & valid_delta
+    )
+    slope_rmse = _rmse(predicted_slope - true_slope, slope_mask)
+    gate_rows = _gate_row_mask(dataset)
+    validation_gate_rows = gate_rows[validation_indices]
+    gate_rmse = None
+    if channels == 2 and np.any(validation_gate_rows):
+        gate_error = (
+            reconstruction[validation_gate_rows, points : 2 * points]
+            - validation_target[validation_gate_rows, points : 2 * points]
+        )
+        gate_rmse = _rmse(gate_error)
+    feature_statistics = _feature_error_statistics(
+        dataset,
+        validation_indices,
+        dataset.log_current[validation_indices],
+        predicted_log_current,
+        limit=config.feature_eval_limit,
+    )
+    selection_score = _selection_score(
+        validation_rmse=validation_rmse,
+        weighted_rmse=weighted_rmse,
+        low_rmse=low_rmse,
+        subthreshold_rmse=subthreshold_rmse,
+        slope_rmse=slope_rmse,
+        gate_rmse=gate_rmse,
+        feature_statistics=feature_statistics,
+        gate_loss_weight=config.gate_loss_weight,
+    )
+    train_projection = mean + (predicted_train * safe_scales) @ components
+    if threshold_focus and focus_envelope is not None:
+        train_projection = _remove_threshold_focus_transform(
+            train_projection,
+            drain_focus=focus_envelope[training_indices],
+            points=points,
+        )
+    elif threshold_local_affine_delta_aligned and affine_w is not None and affine_b is not None:
+        predicted_train_affine = (
+            standardized_conditions[training_indices].astype(np.float64) @ affine_w
+            + affine_b
+        ).astype(np.float32)
+        if affine_clip is not None:
+            predicted_train_affine = np.clip(
+                predicted_train_affine,
+                -affine_clip,
+                affine_clip,
+            )
+        train_projection = _remove_threshold_local_aligned_affine_delta_transform(
+            train_projection,
+            grid=dataset.grid,
+            conditions=dataset.conditions[training_indices],
+            aligned_weights=_aligned_threshold_local_weights(
+                drain_focus=focus_envelope[training_indices],
+                grid=dataset.grid,
+                conditions=dataset.conditions[training_indices],
+            ),
+            affine_params=predicted_train_affine,
+            points=points,
+        )
+    elif threshold_local_delta_aligned:
+        train_projection = _remove_threshold_local_aligned_delta_transform(
+            train_projection,
+            grid=dataset.grid,
+            conditions=dataset.conditions[training_indices],
+            points=points,
+        )
+    elif threshold_local_aligned:
+        train_projection = _remove_threshold_local_aligned_transform(
+            train_projection,
+            grid=dataset.grid,
+            conditions=dataset.conditions[training_indices],
+            points=points,
+        )
+    train_error = train_projection[:, :points] - target[training_indices, :points]
+    metric = {
+        "epoch": 1,
+        "train_loss": float(np.mean(train_error * train_error)),
+        "validation_loss": float(np.mean(drain_error * drain_error)),
+        "validation_rmse_decades": validation_rmse,
+        "validation_weighted_rmse_decades": weighted_rmse,
+        "validation_low_current_rmse_decades": low_rmse,
+        "validation_subthreshold_rmse_decades": subthreshold_rmse,
+    }
+    if progress is not None:
+        progress(metric)
+    gate_curve_count = int(np.count_nonzero(gate_rows))
+    if threshold_local_only:
+        method_name = "local_threshold_conditional_pca"
+    elif threshold_local_affine_delta_aligned:
+        method_name = "aligned_local_affine_delta_conditional_pca"
+    elif threshold_local_delta_aligned:
+        method_name = "aligned_local_delta_conditional_pca"
+    elif threshold_local_aligned:
+        method_name = "aligned_local_threshold_conditional_pca"
+    else:
+        method_name = "threshold_conditional_pca" if threshold_focus else "conditional_pca"
+    metadata = {
+        "objective": (
+            "aligned_local_affine_delta_conditioned_pca_residual_reconstruction"
+            if threshold_local_affine_delta_aligned
+            else (
+            "aligned_local_threshold_delta_conditioned_pca_residual_reconstruction"
+            if threshold_local_delta_aligned
+            else (
+            "aligned_local_threshold_window_conditioned_pca_residual_reconstruction"
+            if threshold_local_aligned
+            else (
+            "local_threshold_window_conditioned_pca_residual_reconstruction"
+            if threshold_local_only
+            else (
+            "threshold_focused_conditioned_pca_residual_reconstruction"
+            if threshold_focus
+            else "conditioned_pca_residual_reconstruction"
+            )
+            )
+            )
+            )
+        ),
+        "residual_space": "log10_abs_current_decades",
+        "architecture": method_name,
+        "method": method_name,
+        "channels": ["Ids", "Ig"] if channels == 2 else ["Ids"],
+        "curves": int(dataset.log_current.shape[0]),
+        "gate_curves": gate_curve_count,
+        "training_curves": int(training_indices.size),
+        "validation_curves": int(validation_indices.size),
+        "epochs_completed": 1,
+        "best_epoch": 1,
+        "latent_dim": component_count,
+        "hidden_dim": None,
+        "train_loss": metric["train_loss"],
+        "validation_loss": metric["validation_loss"],
+        "validation_rmse_decades": validation_rmse,
+        "validation_weighted_rmse_decades": weighted_rmse,
+        "validation_low_current_rmse_decades": low_rmse,
+        "validation_subthreshold_rmse_decades": subthreshold_rmse,
+        "validation_subthreshold_slope_rmse_dec_per_v": slope_rmse,
+        "validation_gate_rmse_decades": gate_rmse,
+        "selection_score": selection_score,
+        "best_trial": 1,
+        **feature_statistics,
+        "source": dataset.source,
+        "seed": config.seed,
+        "condition_features": list(CONDITION_NAMES),
+        "sample_balance_strategy": (
+            "rare_curve_density_weighting" if config.rare_curve_weight > 1.0 else "uniform"
+        ),
+        "rare_curve_groups": rare_curve_groups,
+        "training_config": {
+            "method": config.method,
+            "pca_components": config.pca_components,
+            "beta": config.beta,
+            "validation_fraction": config.validation_fraction,
+            "seed": config.seed,
+            "max_curves": config.max_curves,
+            "gate_loss_weight": config.gate_loss_weight,
+            "rare_curve_weight": config.rare_curve_weight,
+            "feature_eval_limit": config.feature_eval_limit,
+        },
+        "training_history": [metric],
+    }
+    if threshold_local_only or threshold_local_aligned or threshold_local_delta_aligned or threshold_local_affine_delta_aligned:
+        metadata["local_threshold_window_scale"] = threshold_local_window_scale
+        metadata["local_threshold_min_window_v"] = threshold_local_min_window_v
+        metadata["local_threshold_floor"] = threshold_local_floor
+    if threshold_local_aligned or threshold_local_delta_aligned or threshold_local_affine_delta_aligned:
+        metadata["threshold_local_align_window_scale"] = threshold_local_window_scale
+        metadata["threshold_local_align_min_window_v"] = threshold_local_min_window_v
+    if threshold_local_delta_aligned or threshold_local_affine_delta_aligned:
+        metadata["threshold_local_delta_transform"] = True
+    if threshold_local_affine_delta_aligned:
+        metadata["threshold_local_affine_restore"] = True
+    _save_conditional_pca_checkpoint(
+        output.expanduser().resolve(),
+        dataset=dataset,
+        mean=mean,
+        components=components,
+        scales=safe_scales,
+        condition_mean=condition_mean,
+        condition_scale=condition_scale,
+        latent_w=latent_w,
+        latent_b=latent_b,
+        latent_noise=latent_noise,
+        latent_clip=latent_clip,
+        metadata=metadata,
+        affine_w=affine_w,
+        affine_b=affine_b,
+        affine_clip=affine_clip,
+        threshold_focus_strength=threshold_focus_strength,
+        threshold_focus_window_scale=threshold_focus_window_scale,
+        threshold_focus_min_window_v=threshold_focus_min_window_v,
+        threshold_local_align_window_scale=(
+            threshold_local_window_scale
+            if threshold_local_aligned or threshold_local_delta_aligned or threshold_local_affine_delta_aligned
+            else None
+        ),
+        threshold_local_align_min_window_v=(
+            threshold_local_min_window_v
+            if threshold_local_aligned or threshold_local_delta_aligned or threshold_local_affine_delta_aligned
+            else None
+        ),
+        threshold_local_delta_transform=(
+            threshold_local_delta_aligned or threshold_local_affine_delta_aligned
+        ),
+    )
+    return NeuralTrainingResult(
+        method=method_name,
+        curves=dataset.log_current.shape[0],
+        gate_curves=gate_curve_count,
+        generated_channels=["Ids", "Ig"] if channels == 2 else ["Ids"],
+        training_curves=training_indices.size,
+        validation_curves=validation_indices.size,
+        epochs_completed=1,
+        best_epoch=1,
+        latent_dim=component_count,
+        hidden_dim=0,
+        train_loss=float(metric["train_loss"]),
+        validation_loss=float(metric["validation_loss"]),
+        validation_rmse_decades=validation_rmse,
+        validation_weighted_rmse_decades=weighted_rmse,
+        validation_low_current_rmse_decades=low_rmse,
+        validation_subthreshold_rmse_decades=subthreshold_rmse,
+        validation_subthreshold_slope_rmse_dec_per_v=slope_rmse,
         validation_gate_rmse_decades=gate_rmse,
         feature_vth_mae_v=feature_statistics.get("feature_vth_mae_v"),
         feature_ss_mae_mv_dec=feature_statistics.get("feature_ss_mae_mv_dec"),
@@ -1327,6 +2620,7 @@ def train_neural_checkpoint(
         else load_database_neural_dataset(database_url)
     )
     dataset = _subsample_dataset(dataset, training_config.max_curves, rng)
+    sample_weights, rare_curve_groups = _sample_balance_weights(dataset, training_config)
     training_indices, validation_indices = _group_split(
         dataset.groups, training_config.validation_fraction, rng
     )
@@ -1342,20 +2636,108 @@ def train_neural_checkpoint(
             validation_indices=validation_indices,
             physics=physics,
             config=training_config,
+            sample_weights=sample_weights,
+            rare_curve_groups=rare_curve_groups,
             progress=progress,
         )
     raw_residual, channels = _training_target(dataset, physics)
-    condition_mean = dataset.conditions[training_indices].mean(axis=0)
-    condition_scale = dataset.conditions[training_indices].std(axis=0)
+    training_sample_weights = sample_weights[training_indices].astype(np.float64)
+    condition_mean = np.average(
+        dataset.conditions[training_indices],
+        axis=0,
+        weights=training_sample_weights,
+    ).astype(np.float32)
+    condition_scale = np.sqrt(
+        np.average(
+            (dataset.conditions[training_indices] - condition_mean) ** 2,
+            axis=0,
+            weights=training_sample_weights,
+        )
+    ).astype(np.float32)
     condition_scale = np.where(condition_scale < 1e-6, 1.0, condition_scale)
     standardized_conditions = (
         (dataset.conditions - condition_mean) / condition_scale
     ).astype(np.float32)
-    residual_mean = raw_residual[training_indices].mean(axis=0)
-    residual_scale = raw_residual[training_indices].std(axis=0)
+    if training_config.method in {
+        "conditional_pca",
+        "threshold_conditional_pca",
+        "local_threshold_conditional_pca",
+        "aligned_local_threshold_conditional_pca",
+        "aligned_local_delta_conditional_pca",
+        "aligned_local_affine_delta_conditional_pca",
+    }:
+        return _train_conditional_pca_checkpoint(
+            output,
+            dataset=dataset,
+            training_indices=training_indices,
+            validation_indices=validation_indices,
+            physics=physics,
+            config=training_config,
+            sample_weights=sample_weights,
+            rare_curve_groups=rare_curve_groups,
+            standardized_conditions=standardized_conditions,
+            condition_mean=condition_mean,
+            condition_scale=condition_scale,
+            progress=progress,
+            threshold_focus=training_config.method == "threshold_conditional_pca",
+            threshold_local_only=training_config.method == "local_threshold_conditional_pca",
+            threshold_local_aligned=(
+                training_config.method == "aligned_local_threshold_conditional_pca"
+            ),
+            threshold_local_delta_aligned=(
+                training_config.method == "aligned_local_delta_conditional_pca"
+            ),
+            threshold_local_affine_delta_aligned=(
+                training_config.method == "aligned_local_affine_delta_conditional_pca"
+            ),
+        )
+    points = dataset.grid.size
+    threshold_local_window_scale = None
+    threshold_local_min_window_v = None
+    threshold_local_floor = None
+    training_target = raw_residual
+    restore_validation_residual: Callable[[np.ndarray], np.ndarray] | None = None
+    if training_config.method == "aligned_local_delta_cvae":
+        (
+            threshold_local_window_scale,
+            threshold_local_min_window_v,
+            threshold_local_floor,
+        ) = _threshold_local_parameters(training_config)
+        focus_envelope = _threshold_local_envelope_from_conditions(
+            grid=dataset.grid,
+            conditions=dataset.conditions,
+            window_scale=threshold_local_window_scale,
+            min_window_v=threshold_local_min_window_v,
+            floor=threshold_local_floor,
+        )
+        training_target = _apply_threshold_local_aligned_delta_transform(
+            raw_residual,
+            drain_focus=focus_envelope,
+            grid=dataset.grid,
+            conditions=dataset.conditions,
+            points=points,
+        )
+        restore_validation_residual = lambda values: _remove_threshold_local_aligned_delta_transform(
+            values,
+            grid=dataset.grid,
+            conditions=dataset.conditions[validation_indices],
+            points=points,
+        )
+    residual_mean = np.average(
+        training_target[training_indices],
+        axis=0,
+        weights=training_sample_weights,
+    ).astype(np.float32)
+    residual_scale = np.sqrt(
+        np.average(
+            (training_target[training_indices] - residual_mean) ** 2,
+            axis=0,
+            weights=training_sample_weights,
+        )
+    ).astype(np.float32)
     residual_scale = np.maximum(residual_scale, 0.1)
     standardized_residual = (
-        (raw_residual - residual_mean) / residual_scale
+        (training_target - residual_mean) / residual_scale
     ).astype(np.float32)
     drain_weights = _point_weights(dataset, training_config)
     point_weights = _training_weights(
@@ -1363,6 +2745,7 @@ def train_neural_checkpoint(
         training_config,
         drain_weights,
         channels,
+        sample_weights=sample_weights,
     )
     low_current_mask, subthreshold_mask = _region_masks(dataset)
 
@@ -1485,6 +2868,7 @@ def train_neural_checkpoint(
         subthreshold_mask=subthreshold_mask,
         batch_size=training_config.batch_size,
         feature_eval_limit=training_config.feature_eval_limit,
+        restore_predicted=restore_validation_residual,
     )
     validation_rmse = float(validation_statistics["validation_rmse_decades"] or 0.0)
     physics_baseline_rmse = float(
@@ -1511,6 +2895,13 @@ def train_neural_checkpoint(
         if physics_baseline_rmse > 0
         else 0.0
     )
+    latent_prior_mean, latent_prior_std = _latent_posterior_statistics(
+        best_parameters,
+        standardized_residual[training_indices],
+        standardized_conditions[training_indices],
+        training_sample_weights,
+        training_config.batch_size,
+    )
     weighted_validation_rmse = validation_statistics.get(
         "validation_weighted_rmse_decades"
     )
@@ -1536,24 +2927,51 @@ def train_neural_checkpoint(
         "subthreshold_weight": training_config.subthreshold_weight,
         "slope_weight": training_config.slope_weight,
         "gate_loss_weight": training_config.gate_loss_weight,
+        "rare_curve_weight": training_config.rare_curve_weight,
         "pca_components": training_config.pca_components,
         "method": training_config.method,
         "feature_eval_limit": training_config.feature_eval_limit,
     }
     gate_curves = int(np.count_nonzero(_gate_row_mask(dataset)))
     gate_rmse = validation_statistics.get("validation_gate_rmse_decades")
-    selection_score = float(
-        (weighted_validation_rmse or validation_rmse)
-        + (
-            training_config.gate_loss_weight * float(gate_rmse)
-            if gate_rmse is not None
-            else 0.0
-        )
+    selection_score = _selection_score(
+        validation_rmse=validation_rmse,
+        weighted_rmse=(
+            float(weighted_validation_rmse)
+            if weighted_validation_rmse is not None
+            else None
+        ),
+        low_rmse=(
+            float(validation_statistics["validation_low_current_rmse_decades"])
+            if validation_statistics["validation_low_current_rmse_decades"] is not None
+            else None
+        ),
+        subthreshold_rmse=(
+            float(validation_statistics["validation_subthreshold_rmse_decades"])
+            if validation_statistics["validation_subthreshold_rmse_decades"] is not None
+            else None
+        ),
+        slope_rmse=(
+            float(validation_statistics["validation_subthreshold_slope_rmse_dec_per_v"])
+            if validation_statistics["validation_subthreshold_slope_rmse_dec_per_v"] is not None
+            else None
+        ),
+        gate_rmse=float(gate_rmse) if gate_rmse is not None else None,
+        feature_statistics=validation_statistics,
+        gate_loss_weight=training_config.gate_loss_weight,
     )
     metadata = {
-        "objective": "weighted_dual_channel_log_residual_cvae",
+        "objective": (
+            "aligned_local_threshold_delta_log_residual_cvae"
+            if training_config.method == "aligned_local_delta_cvae"
+            else "weighted_dual_channel_log_residual_cvae"
+        ),
         "residual_space": "log10_abs_current_decades",
-        "architecture": "conditional_vae",
+        "architecture": (
+            "aligned_local_delta_conditional_vae_residual_skip"
+            if training_config.method == "aligned_local_delta_cvae"
+            else "conditional_vae_residual_skip"
+        ),
         "method": training_config.method,
         "channels": ["Ids", "Ig"] if channels == 2 else ["Ids"],
         "curves": int(dataset.log_current.shape[0]),
@@ -1580,9 +2998,21 @@ def train_neural_checkpoint(
         "source": dataset.source,
         "seed": training_config.seed,
         "beta": training_config.beta,
+        "condition_features": list(CONDITION_NAMES),
+        "sample_balance_strategy": (
+            "rare_curve_density_weighting" if training_config.rare_curve_weight > 1.0 else "uniform"
+        ),
+        "rare_curve_groups": rare_curve_groups,
+        "latent_prior_mean": latent_prior_mean.astype(float).tolist(),
+        "latent_prior_std": np.clip(latent_prior_std, 0.05, 1.0).astype(float).tolist(),
         "training_config": training_config_payload,
         "training_history": history,
     }
+    if training_config.method == "aligned_local_delta_cvae":
+        metadata["threshold_local_align_window_scale"] = threshold_local_window_scale
+        metadata["threshold_local_align_min_window_v"] = threshold_local_min_window_v
+        metadata["local_threshold_floor"] = threshold_local_floor
+        metadata["threshold_local_delta_transform"] = True
     _save_checkpoint(
         output.expanduser().resolve(),
         dataset=dataset,
@@ -1594,7 +3024,7 @@ def train_neural_checkpoint(
         metadata=metadata,
     )
     return NeuralTrainingResult(
-        method="physics_cvae",
+        method=training_config.method,
         curves=dataset.log_current.shape[0],
         gate_curves=gate_curves,
         generated_channels=["Ids", "Ig"] if channels == 2 else ["Ids"],

@@ -14,11 +14,14 @@ import {
 } from "lucide-react";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
+  getModelLeaderboard,
   getModelInfo,
   getNeuralTrainingStatus,
   startNeuralTraining
 } from "../api";
 import type {
+  ExperimentLeaderboardEntry,
+  ExperimentLeaderboardResponse,
   ModelInfo,
   NeuralEpochMetric,
   NeuralTrainingConfig,
@@ -57,6 +60,7 @@ const DEFAULT_CONFIG: NeuralTrainingConfig = {
   subthreshold_weight: 2.5,
   slope_weight: 0.1,
   gate_loss_weight: 0.5,
+  rare_curve_weight: 1.35,
   pca_components: 12,
   feature_eval_limit: 512
 };
@@ -120,6 +124,18 @@ function compact(value: number | null | undefined) {
     : value.toLocaleString();
 }
 
+function methodLabel(method: string, architecture: string | null) {
+  if (architecture === "hybrid_threshold_pca") return "Hybrid";
+  if (method === "threshold_conditional_pca") return "Thresh. Cond. PCA";
+  if (method === "aligned_local_affine_delta_conditional_pca") return "Affine Delta PCA";
+  if (method === "aligned_local_delta_conditional_pca") return "Aligned Delta PCA";
+  if (method === "aligned_local_delta_cvae") return "Aligned Delta CVAE";
+  if (method === "physics_cvae") return "CVAE";
+  if (method === "conditional_pca") return "Cond. PCA";
+  if (method === "latent_pca") return "PCA";
+  return method;
+}
+
 function statusLabel(status: NeuralTrainingStatus | null) {
   if (!status) return "Loading";
   if (status.status === "running") return "Training";
@@ -155,6 +171,8 @@ export function ModelsWorkspace({ model, onModelChange }: ModelsWorkspaceProps) 
   const [status, setStatus] = useState<NeuralTrainingStatus | null>(null);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [leaderboard, setLeaderboard] = useState<ExperimentLeaderboardResponse | null>(null);
+  const [leaderboardError, setLeaderboardError] = useState<string | null>(null);
   const appliedModelConfig = useRef(false);
   const activatedJob = useRef<string | null>(null);
 
@@ -202,6 +220,31 @@ export function ModelsWorkspace({ model, onModelChange }: ModelsWorkspaceProps) 
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+
+    async function refreshLeaderboard() {
+      try {
+        const next = await getModelLeaderboard();
+        if (!cancelled) {
+          setLeaderboard(next);
+          setLeaderboardError(null);
+        }
+      } catch (caught) {
+        if (!cancelled) {
+          setLeaderboardError(
+            caught instanceof Error ? caught.message : "Could not load model leaderboard"
+          );
+        }
+      }
+    }
+
+    void refreshLeaderboard();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (
       status?.status !== "completed" ||
       !status.job_id ||
@@ -210,11 +253,17 @@ export function ModelsWorkspace({ model, onModelChange }: ModelsWorkspaceProps) 
       return;
     }
     activatedJob.current = status.job_id;
-    void getModelInfo().then(onModelChange).catch((caught) => {
-      setError(
-        caught instanceof Error ? caught.message : "Could not refresh active model"
-      );
-    });
+    void Promise.all([getModelInfo(), getModelLeaderboard()])
+      .then(([nextModel, nextLeaderboard]) => {
+        onModelChange(nextModel);
+        setLeaderboard(nextLeaderboard);
+        setLeaderboardError(null);
+      })
+      .catch((caught) => {
+        setError(
+          caught instanceof Error ? caught.message : "Could not refresh active model"
+        );
+      });
   }, [onModelChange, status?.job_id, status?.status]);
 
   const running = status?.status === "running";
@@ -278,9 +327,57 @@ export function ModelsWorkspace({ model, onModelChange }: ModelsWorkspaceProps) 
   const activeMethod =
     model?.architecture === "latent_pca"
       ? "latent_pca"
-      : model?.architecture === "conditional_vae"
+      : model?.architecture === "hybrid_threshold_pca"
+        ? "conditional_pca"
+      : model?.architecture === "aligned_local_affine_delta_conditional_pca"
+        ? "aligned_local_affine_delta_conditional_pca"
+      : model?.architecture === "aligned_local_delta_conditional_pca"
+        ? "aligned_local_delta_conditional_pca"
+      : model?.architecture === "aligned_local_delta_conditional_vae_residual_skip"
+        ? "aligned_local_delta_cvae"
+      : model?.architecture === "threshold_conditional_pca"
+        ? "threshold_conditional_pca"
+      : model?.architecture === "conditional_pca"
+        ? "conditional_pca"
+      : model?.architecture === "conditional_vae" ||
+          model?.architecture === "conditional_vae_residual_skip"
         ? "physics_cvae"
         : config.method;
+  const leaderboardEntries = leaderboard?.entries ?? [];
+  const bestJumpEntry = leaderboard?.best_jump_entry ?? leaderboardEntries[0] ?? null;
+  const bestCanonicalEntry = useMemo<ExperimentLeaderboardEntry | null>(
+    () =>
+      leaderboard?.best_canonical_entry ??
+      leaderboardEntries.reduce<ExperimentLeaderboardEntry | null>((best, entry) => {
+        if (entry.canonical_jump_max_decades === null) return best;
+        if (best === null || best.canonical_jump_max_decades === null) return entry;
+        if (entry.canonical_jump_max_decades < best.canonical_jump_max_decades) {
+          return entry;
+        }
+        if (
+          entry.canonical_jump_max_decades === best.canonical_jump_max_decades &&
+          (entry.generated_vth_mae_v ?? Number.POSITIVE_INFINITY) <
+            (best.generated_vth_mae_v ?? Number.POSITIVE_INFINITY)
+        ) {
+          return entry;
+        }
+        return best;
+      }, null),
+    [leaderboard?.best_canonical_entry, leaderboardEntries]
+  );
+  const bestWeightedEntry = useMemo<ExperimentLeaderboardEntry | null>(
+    () =>
+      leaderboard?.best_weighted_entry ??
+      leaderboardEntries.reduce<ExperimentLeaderboardEntry | null>((best, entry) => {
+        if (entry.validation_weighted_rmse_decades === null) return best;
+        if (best === null || best.validation_weighted_rmse_decades === null) return entry;
+        return entry.validation_weighted_rmse_decades <
+          best.validation_weighted_rmse_decades
+          ? entry
+          : best;
+      }, null),
+    [leaderboard?.best_weighted_entry, leaderboardEntries]
+  );
 
   function patchConfig(patch: Partial<NeuralTrainingConfig>) {
     setConfig((current) => ({ ...current, ...patch }));
@@ -388,7 +485,7 @@ export function ModelsWorkspace({ model, onModelChange }: ModelsWorkspaceProps) 
           <label className="neural-field neural-field-wide">
             <span>
               <strong>Generation method</strong>
-              <small>Choose the stochastic main model or the stable latent baseline.</small>
+              <small>Choose between the stochastic CVAE, the unconditional PCA baseline, and threshold-aware conditioned PCA variants.</small>
             </span>
             <select
               value={config.method}
@@ -397,11 +494,29 @@ export function ModelsWorkspace({ model, onModelChange }: ModelsWorkspaceProps) 
                 patchConfig({
                   method: event.currentTarget.value as
                     | "physics_cvae"
+                    | "aligned_local_delta_cvae"
                     | "latent_pca"
+                    | "conditional_pca"
+                    | "threshold_conditional_pca"
+                    | "aligned_local_delta_conditional_pca"
+                    | "aligned_local_affine_delta_conditional_pca"
                 })
               }
             >
               <option value="physics_cvae">Physics-aware conditional VAE</option>
+              <option value="aligned_local_delta_cvae">
+                Threshold-aligned delta CVAE
+              </option>
+              <option value="conditional_pca">Conditioned latent PCA</option>
+              <option value="threshold_conditional_pca">
+                Threshold-focused conditioned PCA
+              </option>
+              <option value="aligned_local_delta_conditional_pca">
+                Threshold-aligned delta PCA
+              </option>
+              <option value="aligned_local_affine_delta_conditional_pca">
+                Threshold-aligned affine-delta PCA
+              </option>
               <option value="latent_pca">Physics residual + latent PCA</option>
             </select>
           </label>
@@ -450,7 +565,7 @@ export function ModelsWorkspace({ model, onModelChange }: ModelsWorkspaceProps) 
           </label>
 
           <div className="parameter-group-label">Model capacity</div>
-          {config.method === "physics_cvae" ? (
+          {config.method === "physics_cvae" || config.method === "aligned_local_delta_cvae" ? (
             <>
               <NumberField
                 label="Latent dimensions"
@@ -475,7 +590,14 @@ export function ModelsWorkspace({ model, onModelChange }: ModelsWorkspaceProps) 
           ) : (
             <NumberField
               label="PCA components"
-              help="Latent basis size for the stable residual baseline."
+              help={
+                config.method === "conditional_pca" ||
+                config.method === "threshold_conditional_pca" ||
+                config.method === "aligned_local_delta_conditional_pca" ||
+                config.method === "aligned_local_affine_delta_conditional_pca"
+                  ? "Latent basis size before condition-to-latent regression."
+                  : "Latent basis size for the stable residual baseline."
+              }
               value={config.pca_components}
               min={1}
               max={64}
@@ -525,8 +647,18 @@ export function ModelsWorkspace({ model, onModelChange }: ModelsWorkspaceProps) 
             disabled={running}
             onChange={(gate_loss_weight) => patchConfig({ gate_loss_weight })}
           />
+          <NumberField
+            label="Rare-curve boost"
+            help="Upweight sparse device regimes so the model learns uncommon but real shapes."
+            value={config.rare_curve_weight}
+            min={1}
+            max={10}
+            step={0.05}
+            disabled={running}
+            onChange={(rare_curve_weight) => patchConfig({ rare_curve_weight })}
+          />
 
-          {config.method === "physics_cvae" ? (
+          {config.method === "physics_cvae" || config.method === "aligned_local_delta_cvae" ? (
             <>
               <div className="parameter-group-label">Optimization</div>
               <NumberField
@@ -569,6 +701,23 @@ export function ModelsWorkspace({ model, onModelChange }: ModelsWorkspaceProps) 
                 onChange={(beta) => patchConfig({ beta })}
               />
             </>
+          ) : config.method === "conditional_pca" ||
+            config.method === "threshold_conditional_pca" ||
+            config.method === "aligned_local_delta_conditional_pca" ||
+            config.method === "aligned_local_affine_delta_conditional_pca" ? (
+            <>
+              <div className="parameter-group-label">Condition regression</div>
+              <NumberField
+                label="Ridge beta"
+                help="Regularization on the condition-to-latent regression weights."
+                value={config.beta}
+                min={0}
+                max={1}
+                step={0.001}
+                disabled={running}
+                onChange={(beta) => patchConfig({ beta })}
+              />
+            </>
           ) : null}
 
           <div className="parameter-group-label">Validation and control</div>
@@ -582,7 +731,7 @@ export function ModelsWorkspace({ model, onModelChange }: ModelsWorkspaceProps) 
             disabled={running}
             onChange={(validation_fraction) => patchConfig({ validation_fraction })}
           />
-          {config.method === "physics_cvae" ? (
+          {config.method === "physics_cvae" || config.method === "aligned_local_delta_cvae" ? (
             <NumberField
               label="Early stopping"
               help="Epochs without validation improvement."
@@ -704,10 +853,18 @@ export function ModelsWorkspace({ model, onModelChange }: ModelsWorkspaceProps) 
 
           <section className="loss-chart-panel">
             <div className="panel-title-row">
-              <div>
-                <h2>Optimization history</h2>
-                <p>Weighted log-residual VAE objective on grouped source splits.</p>
-              </div>
+                <div>
+                  <h2>Optimization history</h2>
+                  <p>
+                    {activeMethod === "physics_cvae"
+                      ? "Weighted log-residual VAE objective on grouped source splits."
+                      : activeMethod === "threshold_conditional_pca"
+                        ? "Single-step threshold-focused conditioned PCA fit on grouped source splits."
+                      : activeMethod === "conditional_pca"
+                        ? "Single-step conditioned PCA fit on grouped source splits."
+                        : "Single-step latent PCA reconstruction on grouped source splits."}
+                  </p>
+                </div>
               <div className="chart-current-values">
                 <span>
                   Train <strong>{metric(latest?.train_loss ?? model?.train_loss, 4)}</strong>
@@ -761,7 +918,15 @@ export function ModelsWorkspace({ model, onModelChange }: ModelsWorkspaceProps) 
                         }
                       >
                         <td>{trial.trial}</td>
-                        <td>{trial.method === "physics_cvae" ? "CVAE" : "PCA"}</td>
+                        <td>
+                          {trial.method === "physics_cvae"
+                            ? "CVAE"
+                            : trial.method === "threshold_conditional_pca"
+                              ? "Thresh. Cond. PCA"
+                            : trial.method === "conditional_pca"
+                              ? "Cond. PCA"
+                              : "PCA"}
+                        </td>
                         <td>{trial.latent_dim}</td>
                         <td>{trial.hidden_dim || "—"}</td>
                         <td>{trial.learning_rate.toExponential(2)}</td>
@@ -856,6 +1021,138 @@ export function ModelsWorkspace({ model, onModelChange }: ModelsWorkspaceProps) 
             </div>
           </section>
 
+          <section className="trial-comparison-panel">
+            <div className="panel-title-row">
+              <div>
+                <h2>Experiment leaderboard</h2>
+                <p>
+                  Real database-backed attempts ranked by threshold-jump behavior,
+                  so we can compare multiple model families side by side.
+                </p>
+              </div>
+              <span className="trial-best-label">
+                {leaderboard?.report_path ? "Report available" : "Top experiments"}
+              </span>
+            </div>
+            {leaderboardError ? (
+              <div className="error-banner model-error" role="alert">
+                {leaderboardError}
+              </div>
+            ) : null}
+            {leaderboardEntries.length > 0 ? (
+              <div className="evaluation-grid">
+                <EvaluationMetric
+                  label="Best held-out jump"
+                  value={metric(bestJumpEntry?.jump_p95_decades, 4)}
+                  unit="dec"
+                  note={
+                    bestJumpEntry
+                      ? `${bestJumpEntry.name} • ${methodLabel(
+                          bestJumpEntry.method,
+                          bestJumpEntry.architecture
+                        )}`
+                      : "n/a"
+                  }
+                />
+                <EvaluationMetric
+                  label="Best canonical 100% AI"
+                  value={metric(bestCanonicalEntry?.canonical_jump_max_decades, 4)}
+                  unit="dec"
+                  note={
+                    bestCanonicalEntry
+                      ? `${bestCanonicalEntry.name} • ${methodLabel(
+                          bestCanonicalEntry.method,
+                          bestCanonicalEntry.architecture
+                        )}`
+                      : "n/a"
+                  }
+                />
+                <EvaluationMetric
+                  label="Best weighted RMSE"
+                  value={metric(bestWeightedEntry?.validation_weighted_rmse_decades, 4)}
+                  unit="dec"
+                  note={
+                    bestWeightedEntry
+                      ? `${bestWeightedEntry.name} • ${methodLabel(
+                          bestWeightedEntry.method,
+                          bestWeightedEntry.architecture
+                        )}`
+                      : "n/a"
+                  }
+                />
+              </div>
+            ) : null}
+            {leaderboard?.comparison_artifact_url ? (
+              <div className="leaderboard-artifact-panel">
+                <div className="leaderboard-artifact-copy">
+                  <strong>Canonical 100% AI snapshot</strong>
+                  <p>
+                    This fixed SVG compares the strongest current candidates under
+                    one identical condition, so the Vth-region jump is visible at
+                    a glance before reading the table.
+                  </p>
+                  <a
+                    className="button secondary compact"
+                    href={leaderboard.comparison_artifact_url}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Open SVG
+                  </a>
+                </div>
+                <img
+                  src={leaderboard.comparison_artifact_url}
+                  alt="Canonical 100% AI model comparison"
+                />
+              </div>
+            ) : null}
+            <div className="trial-table-wrap">
+              <table className="trial-table">
+                <thead>
+                  <tr>
+                    <th>Rank</th>
+                    <th>Model</th>
+                    <th>Method</th>
+                    <th>Jump P95</th>
+                    <th>Canon. max</th>
+                    <th>Spike rate</th>
+                    <th>Gen. Vth MAE</th>
+                    <th>Gen. SS MAE</th>
+                    <th>Weighted RMSE</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {leaderboardEntries.length === 0 ? (
+                    <tr>
+                      <td colSpan={9}>No experiment summaries discovered yet.</td>
+                    </tr>
+                  ) : (
+                    leaderboardEntries.map((entry, index) => {
+                      const active = entry.checkpoint_path === model?.checkpoint_path;
+                      return (
+                        <tr key={`${entry.experiment_path}-${entry.name}`} className={active ? "best" : undefined}>
+                          <td>{index + 1}</td>
+                          <td>
+                            <strong>{entry.name}</strong>
+                            <br />
+                            <small>{entry.description ?? entry.experiment_path}</small>
+                          </td>
+                          <td>{methodLabel(entry.method, entry.architecture)}</td>
+                          <td>{metric(entry.jump_p95_decades, 4)}</td>
+                          <td>{metric(entry.canonical_jump_max_decades, 4)}</td>
+                          <td>{metric(entry.jump_spike_rate, 4)}</td>
+                          <td>{metric(entry.generated_vth_mae_v, 3)}</td>
+                          <td>{metric(entry.generated_ss_mae_mv_dec, 1)}</td>
+                          <td>{metric(entry.validation_weighted_rmse_decades, 4)}</td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
           <div className="training-detail-grid">
             <section className="dataset-split-panel">
               <div className="panel-section-heading">
@@ -913,8 +1210,14 @@ export function ModelsWorkspace({ model, onModelChange }: ModelsWorkspaceProps) 
                   <h2>Network structure</h2>
                   <p>
                     {activeMethod === "physics_cvae"
-                      ? "Physics-residual conditional variational autoencoder."
-                      : "Physics-residual latent PCA baseline."}
+                      ? "Physics-residual conditional variational autoencoder with a direct condition skip path."
+                      : model?.architecture === "hybrid_threshold_pca"
+                        ? "Stable PCA backbone with a threshold-local conditioned PCA guide blended around Vth."
+                      : activeMethod === "threshold_conditional_pca"
+                        ? "Conditioned PCA trained in a threshold-emphasized residual space so more latent capacity is spent around Vth."
+                      : activeMethod === "conditional_pca"
+                        ? "Physics-residual PCA basis with a learned condition-to-latent regressor."
+                        : "Physics-residual latent PCA baseline."}
                   </p>
                 </div>
               </div>
@@ -925,10 +1228,10 @@ export function ModelsWorkspace({ model, onModelChange }: ModelsWorkspaceProps) 
                   <small>{generatedChannels.join(" + ")}</small>
                 </div>
                 <b aria-hidden="true">+</b>
-                <div>
-                  <span>Condition</span>
-                  <strong>9</strong>
-                  <small>device features</small>
+              <div>
+                <span>Condition</span>
+                  <strong>{model?.condition_features.length || 9}</strong>
+                  <small>conditioning features</small>
                 </div>
                 <b aria-hidden="true">-&gt;</b>
                 {activeMethod === "physics_cvae" ? (
@@ -950,7 +1253,15 @@ export function ModelsWorkspace({ model, onModelChange }: ModelsWorkspaceProps) 
                         : config.pca_components)}
                   </strong>
                   <small>
-                    {activeMethod === "physics_cvae" ? "mu, logvar" : "PCA basis"}
+                    {activeMethod === "physics_cvae"
+                      ? "mu, logvar"
+                      : model?.architecture === "hybrid_threshold_pca"
+                        ? "base + guide basis"
+                      : activeMethod === "threshold_conditional_pca"
+                        ? "threshold-focused PCA basis"
+                      : activeMethod === "conditional_pca"
+                        ? "conditioned PCA basis"
+                        : "PCA basis"}
                   </small>
                 </div>
                 <b aria-hidden="true">-&gt;</b>
@@ -971,11 +1282,26 @@ export function ModelsWorkspace({ model, onModelChange }: ModelsWorkspaceProps) 
                 </div>
               </div>
               <p className="architecture-note">
-                The active checkpoint generates Ids residuals and, when Ig training
-                curves are available, centered gate-current morphology. Both are
-                blended with analytical baselines before measurement noise and
-                physical projection are applied.
+                {model?.architecture === "hybrid_threshold_pca"
+                  ? "The active checkpoint samples a stable global PCA residual, predicts a conditioned PCA guide around threshold, and blends the two with a local Vth-centered envelope before the physics-side jump limiter runs."
+                  : activeMethod === "threshold_conditional_pca"
+                  ? "The active checkpoint predicts latent coefficients in a threshold-weighted residual space, then removes that weighting during sampling so more model capacity is spent around the Vth transition."
+                  : activeMethod === "conditional_pca"
+                  ? "The active checkpoint predicts a latent mean from the requested device conditions, adds learned latent noise for diversity, and reconstructs Ids/Ig residuals before blending them with the analytical baseline."
+                  : "The active checkpoint generates Ids residuals and, when Ig training curves are available, centered gate-current morphology. Both are blended with analytical baselines before measurement noise and physical projection are applied."}
               </p>
+              <div className="architecture-meta">
+                <span>Balance: {model?.sample_balance_strategy ?? "uniform"}</span>
+                <span>
+                  Rare groups: {(model?.rare_curve_groups ?? 0).toLocaleString()}
+                </span>
+                <span>
+                  Features:{" "}
+                  {model?.condition_features.length
+                    ? model.condition_features.join(", ")
+                    : "legacy checkpoint"}
+                </span>
+              </div>
             </section>
           </div>
 

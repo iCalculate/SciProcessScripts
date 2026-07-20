@@ -10,6 +10,8 @@ interface AppHeaderProps {
   exportHref: string | null;
   exportFilename: string | null;
   exportDisabled: boolean;
+  exportLabel?: string;
+  onExportClick?: () => void;
 }
 
 export function AppHeader({
@@ -19,7 +21,9 @@ export function AppHeader({
   onTabChange,
   exportHref,
   exportFilename,
-  exportDisabled
+  exportDisabled,
+  exportLabel = "Export",
+  onExportClick
 }: AppHeaderProps) {
   return (
     <header className="app-header">
@@ -45,19 +49,28 @@ export function AppHeader({
           <span className="status-dot" />
           API {apiOnline ? "Online" : "Offline"}
         </span>
-        {exportHref && exportFilename && !exportDisabled ? (
+        {onExportClick ? (
+          <button
+            className="button secondary compact"
+            disabled={exportDisabled}
+            onClick={onExportClick}
+          >
+            <Download size={15} />
+            {exportLabel}
+          </button>
+        ) : exportHref && exportFilename && !exportDisabled ? (
           <a
             className="button secondary compact"
             href={exportHref}
             download={exportFilename}
           >
             <Download size={15} />
-            Export
+            {exportLabel}
           </a>
         ) : (
           <button className="button secondary compact" disabled>
             <Download size={15} />
-            Export
+            {exportLabel}
           </button>
         )}
       </div>

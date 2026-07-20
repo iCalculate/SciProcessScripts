@@ -14,6 +14,7 @@ from devicecurvegen.database import (
     export_curve_rows,
     get_curve_detail,
     list_curves,
+    match_matrix_sites,
     raw_gate_points,
     raw_points,
     source_files,
@@ -181,6 +182,85 @@ def test_database_schema_and_curve_browser_queries(tmp_path: Path) -> None:
     assert len(exported["raw_points"]) == 2
     assert len(exported["gate_points"]) == 2
     assert len(exported["aligned_gate_points"]) == 2
+
+
+def test_matrix_site_matching_prefers_nearest_unique_curve(tmp_path: Path) -> None:
+    url = f"sqlite+pysqlite:///{tmp_path / 'curves.db'}"
+    engine = create_engine(url, future=True)
+    create_schema(engine)
+    with engine.begin() as connection:
+        source_id = connection.execute(
+            insert(source_files).values(
+                source_path="User/matrix.csv",
+                extension=".csv",
+                size_bytes=123,
+                modified_at=datetime(2026, 6, 20, 12, 0, 0),
+                sha1=None,
+                created_at=datetime(2026, 6, 20, 12, 0, 0),
+            )
+        ).inserted_primary_key[0]
+        config_id = connection.execute(
+            insert(test_configs).values(
+                source_file_id=source_id,
+                table_name="DataBlock1",
+                source_kind="b1500_csv",
+                setup_title="IdVg",
+                primitive_test="I/V Sweep",
+                x_axis_data="Vg",
+                voltage_column="Vg",
+                current_column="Id",
+                gate_current_column=None,
+                classification="transfer",
+                classification_reason="graph x-axis is swept gate voltage",
+                classification_confidence=0.98,
+                columns_json=["Vg", "Id"],
+                metadata_json={"SetupTitle": ["IdVg"]},
+            )
+        ).inserted_primary_key[0]
+        for curve_id, vth, ion in [("lowvth", 0.2, 1e-6), ("highvth", 1.8, 8e-6)]:
+            connection.execute(
+                insert(curves).values(
+                    curve_id=curve_id,
+                    source_file_id=source_id,
+                    test_config_id=config_id,
+                    segment_index=1,
+                    direction="forward",
+                    rows_clean=2,
+                    voltage_min_v=0,
+                    voltage_max_v=2,
+                    ion=ion,
+                    ioff=1e-12,
+                    ion_ioff_ratio=ion / 1e-12,
+                    polarity="n-type",
+                    has_gate_current=0,
+                    vth=vth,
+                    ss_mv_dec=100,
+                    ss_fit_r2=0.99,
+                    gm_max=1e-7,
+                    vth_gmmax=vth,
+                    von=0.1,
+                    hysteresis_v=None,
+                    leakage_level=1e-12,
+                    noise_log_sigma=0.01,
+                    ambipolar_strength=0.0,
+                    current_floor=1e-12,
+                    imported_at=datetime(2026, 6, 20, 12, 0, 0),
+                )
+            )
+
+    assignments = match_matrix_sites(
+        url,
+        site_targets=[
+            {"site": "A1", "row": 1, "col": 1, "parameters": {"target_vth": 0.25}},
+            {"site": "B1", "row": 1, "col": 2, "parameters": {"target_vth": 0.3}},
+        ],
+        filters={"polarity": "n-type"},
+        duplicate_mode="avoid",
+    )
+
+    assert assignments[0]["curve_id"] == "lowvth"
+    assert assignments[1]["curve_id"] == "highvth"
+    assert assignments[1]["source"] == "database"
 
 
 def test_backfill_b1500_gate_points_imports_raw_and_aligned_ig(tmp_path: Path) -> None:

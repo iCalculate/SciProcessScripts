@@ -1,6 +1,6 @@
 import createPlotlyComponent from "react-plotly.js/factory";
 import Plotly from "plotly.js-basic-dist-min";
-import type { Data, Layout, PlotMouseEvent, PlotSelectionEvent } from "plotly.js";
+import type { Data, Layout, PlotMouseEvent, PlotlyHTMLElement, PlotSelectionEvent } from "plotly.js";
 import {
   Activity,
   BarChart3,
@@ -15,7 +15,14 @@ import {
   Table2,
   Target
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type InputHTMLAttributes,
+  type MouseEvent as ReactMouseEvent
+} from "react";
 import {
   ApiError,
   exportDatabaseSelection,
@@ -36,6 +43,7 @@ import type {
 } from "../types";
 
 const Plot = createPlotlyComponent(Plotly);
+const PlotlyApi = Plotly as unknown as typeof import("plotly.js");
 
 const PREVIEW_CURVE_LIMIT = 32;
 const ANALYSIS_SCATTER_RENDER_LIMIT = 1_600;
@@ -43,7 +51,8 @@ const ANALYSIS_PCA_CLUSTER_LIMIT = 900;
 const EMPTY_PREVIEW = {
   title: "Preview",
   detail: "No active selection",
-  ids: [] as string[]
+  ids: [] as string[],
+  focusCurveId: null as string | null
 };
 
 const METRIC_LABELS: Record<string, string> = {
@@ -107,6 +116,9 @@ const PALETTE = [
 
 type PreviewRequest = typeof EMPTY_PREVIEW;
 type ColorMode = "cluster" | "polarity" | "source_kind" | "direction";
+
+type PcaMarkerCustomData = [string, string, string];
+type PcaHullCustomData = ["__cluster__", string];
 
 function metricLabel(name: string): string {
   return METRIC_LABELS[name] ?? name;
@@ -236,6 +248,76 @@ function densityCurve(values: number[], min: number, max: number, countScale: nu
   return { x, y: raw.map((value) => (value / maxDensity) * countScale) };
 }
 
+function cross(origin: { x: number; y: number }, left: { x: number; y: number }, right: { x: number; y: number }) {
+  return (left.x - origin.x) * (right.y - origin.y) - (left.y - origin.y) * (right.x - origin.x);
+}
+
+function convexHull(points: { x: number; y: number }[]) {
+  if (points.length <= 1) return points;
+  const sorted = [...points].sort((left, right) => (left.x === right.x ? left.y - right.y : left.x - right.x));
+  const lower: { x: number; y: number }[] = [];
+  sorted.forEach((point) => {
+    while (lower.length >= 2 && cross(lower[lower.length - 2]!, lower[lower.length - 1]!, point) <= 0) {
+      lower.pop();
+    }
+    lower.push(point);
+  });
+  const upper: { x: number; y: number }[] = [];
+  [...sorted].reverse().forEach((point) => {
+    while (upper.length >= 2 && cross(upper[upper.length - 2]!, upper[upper.length - 1]!, point) <= 0) {
+      upper.pop();
+    }
+    upper.push(point);
+  });
+  lower.pop();
+  upper.pop();
+  return [...lower, ...upper];
+}
+
+function circlePolygon(centerX: number, centerY: number, radiusX: number, radiusY: number, segments = 18) {
+  return Array.from({ length: segments }, (_, index) => {
+    const angle = (Math.PI * 2 * index) / segments;
+    return {
+      x: centerX + radiusX * Math.cos(angle),
+      y: centerY + radiusY * Math.sin(angle)
+    };
+  });
+}
+
+function clusterEnvelope(
+  points: { x: number; y: number }[],
+  xSpan: number,
+  ySpan: number
+) {
+  if (points.length === 0) return [];
+  const safeXSpan = Math.max(Math.abs(xSpan), 1);
+  const safeYSpan = Math.max(Math.abs(ySpan), 1);
+  const radiusX = safeXSpan * 0.035;
+  const radiusY = safeYSpan * 0.035;
+  if (points.length === 1) {
+    const [point] = points;
+    return circlePolygon(point.x, point.y, radiusX, radiusY);
+  }
+  if (points.length === 2) {
+    const centerX = 0.5 * (points[0]!.x + points[1]!.x);
+    const centerY = 0.5 * (points[0]!.y + points[1]!.y);
+    const dx = points[1]!.x - points[0]!.x;
+    const dy = points[1]!.y - points[0]!.y;
+    const length = Math.max(Math.hypot(dx, dy), Number.EPSILON);
+    const nx = -dy / length;
+    const ny = dx / length;
+    return [
+      { x: points[0]!.x + nx * radiusX, y: points[0]!.y + ny * radiusY },
+      { x: centerX + nx * radiusX * 1.2, y: centerY + ny * radiusY * 1.2 },
+      { x: points[1]!.x + nx * radiusX, y: points[1]!.y + ny * radiusY },
+      { x: points[1]!.x - nx * radiusX, y: points[1]!.y - ny * radiusY },
+      { x: centerX - nx * radiusX * 1.2, y: centerY - ny * radiusY * 1.2 },
+      { x: points[0]!.x - nx * radiusX, y: points[0]!.y - ny * radiusY }
+    ];
+  }
+  return convexHull(points);
+}
+
 function pearsonFor(samples: AnalysisSample[], xMetric: string, yMetric: string) {
   const points = samples.flatMap((sample) => {
     const x = sampleMetric(sample, xMetric);
@@ -273,14 +355,205 @@ function colorFor(label: string): string {
   return PALETTE[hash % PALETTE.length];
 }
 
-function plotConfig(selectable = false) {
+function paletteAt(index: number): string {
+  return PALETTE[((index % PALETTE.length) + PALETTE.length) % PALETTE.length];
+}
+
+function hexToRgb(hex: string) {
+  const normalized = hex.replace("#", "");
+  const safe = normalized.length === 3
+    ? normalized.split("").map((char) => `${char}${char}`).join("")
+    : normalized;
+  const value = Number.parseInt(safe, 16);
+  return {
+    r: (value >> 16) & 255,
+    g: (value >> 8) & 255,
+    b: value & 255
+  };
+}
+
+function rgba(hex: string, alpha: number) {
+  const { r, g, b } = hexToRgb(hex);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function interpolateHex(left: string, right: string, t: number) {
+  const clamped = Math.max(0, Math.min(1, t));
+  const a = hexToRgb(left);
+  const b = hexToRgb(right);
+  const r = Math.round(a.r + (b.r - a.r) * clamped);
+  const g = Math.round(a.g + (b.g - a.g) * clamped);
+  const bValue = Math.round(a.b + (b.b - a.b) * clamped);
+  return `rgb(${r}, ${g}, ${bValue})`;
+}
+
+function correlationColor(value: number) {
+  const clamped = Math.max(-1, Math.min(1, value));
+  if (clamped < 0) return interpolateHex("#1d5fd1", "#fbfdff", clamped + 1);
+  return interpolateHex("#fbfdff", "#cb2f69", clamped);
+}
+
+function sequentialGradientColor(index: number, total: number) {
+  if (total <= 1) return "#2d7cff";
+  return interpolateHex("#7fb2ff", "#1459cb", index / (total - 1));
+}
+
+function multiplySquareMatrix(left: number[][], right: number[][]) {
+  const size = left.length;
+  return Array.from({ length: size }, (_, rowIndex) =>
+    Array.from({ length: size }, (_, columnIndex) => {
+      let sum = 0;
+      for (let pivot = 0; pivot < size; pivot += 1) {
+        sum += (left[rowIndex]?.[pivot] ?? 0) * (right[pivot]?.[columnIndex] ?? 0);
+      }
+      return sum;
+    })
+  );
+}
+
+function correlationMatrixForOrder(matrix: (number | null)[][], order: number) {
+  const base = matrix.map((row, rowIndex) =>
+    row.map((value, columnIndex) => (rowIndex === columnIndex ? 0 : value ?? 0))
+  );
+  if (order <= 1) return base;
+  let powered = base.map((row) => [...row]);
+  for (let step = 1; step < order; step += 1) {
+    powered = multiplySquareMatrix(powered, base);
+  }
+  const maxAbs = Math.max(
+    1e-9,
+    ...powered.flatMap((row, rowIndex) =>
+      row.map((value, columnIndex) => (rowIndex === columnIndex ? 0 : Math.abs(value)))
+    )
+  );
+  return powered.map((row, rowIndex) =>
+    row.map((value, columnIndex) => (rowIndex === columnIndex ? 0 : value / maxAbs))
+  );
+}
+
+function quantile(values: number[], fraction: number) {
+  if (values.length === 0) return null;
+  const ordered = [...values].sort((left, right) => left - right);
+  const position = (ordered.length - 1) * fraction;
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  if (lower === upper) return ordered[lower] ?? null;
+  const mix = position - lower;
+  return (ordered[lower] ?? 0) * (1 - mix) + (ordered[upper] ?? 0) * mix;
+}
+
+function numericInputValue(value: number | null, fallback: number | null): string {
+  if (value !== null && Number.isFinite(value)) return String(value);
+  if (fallback !== null && Number.isFinite(fallback)) return String(fallback);
+  return "";
+}
+
+function parseNumericInput(value: string): number | null {
+  if (value.trim() === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function expandedRange(min: number | null, max: number | null, paddingRatio = 0.08) {
+  if (min === null || max === null || !Number.isFinite(min) || !Number.isFinite(max)) return undefined;
+  if (min === max) {
+    const padding = Math.max(Math.abs(min) * paddingRatio, 1);
+    return [min - padding, max + padding] as [number, number];
+  }
+  const padding = (max - min) * paddingRatio;
+  return [min - padding, max + padding] as [number, number];
+}
+
+function clampInteger(value: number | null, min: number, max: number) {
+  if (value === null) return null;
+  return Math.max(min, Math.min(max, Math.round(value)));
+}
+
+function clampPositive(value: number | null) {
+  if (value === null || value <= 0) return null;
+  return value;
+}
+
+function CommitNumberInput({
+  value,
+  fallback = null,
+  onCommit,
+  normalize,
+  ...props
+}: Omit<InputHTMLAttributes<HTMLInputElement>, "type" | "value" | "onChange"> & {
+  value: number | null;
+  fallback?: number | null;
+  onCommit: (value: number | null) => void;
+  normalize?: (value: number | null) => number | null;
+}) {
+  const [draft, setDraft] = useState(() => numericInputValue(value, fallback));
+  const [focused, setFocused] = useState(false);
+
+  useEffect(() => {
+    if (!focused) setDraft(numericInputValue(value, fallback));
+  }, [fallback, focused, value]);
+
+  function commit() {
+    const parsed = parseNumericInput(draft);
+    onCommit(normalize ? normalize(parsed) : parsed);
+    setFocused(false);
+  }
+
+  return (
+    <input
+      {...props}
+      type="number"
+      value={draft}
+      onFocus={() => setFocused(true)}
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={commit}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          event.currentTarget.blur();
+          return;
+        }
+        if (event.key === "Escape") {
+          setDraft(numericInputValue(value, fallback));
+          event.preventDefault();
+          event.currentTarget.blur();
+        }
+      }}
+    />
+  );
+}
+
+function numericBounds(values: number[]) {
+  if (values.length === 0) return { min: null as number | null, max: null as number | null };
+  return {
+    min: Math.min(...values),
+    max: Math.max(...values)
+  };
+}
+
+function resolvedRange(min: number | null, max: number | null): [number, number] | undefined {
+  return min !== null && max !== null && max > min ? [min, max] : undefined;
+}
+
+function formatRangeLabel(metric: string, start: number, end: number) {
+  return `${metricLabel(metric)} ${metricValue(metric, start)} to ${metricValue(metric, end)}`;
+}
+
+function plotConfig(
+  selectable = false,
+  options?: {
+    scrollZoom?: boolean;
+    doubleClick?: false | "reset+autosize" | "reset" | "autosize";
+  }
+) {
   void selectable;
   return {
     responsive: true,
     displaylogo: false,
     displayModeBar: false,
     editable: false,
-    scrollZoom: false
+    scrollZoom: options?.scrollZoom ?? false,
+    doubleClick: options?.doubleClick ?? "reset+autosize"
   };
 }
 
@@ -384,14 +657,15 @@ function HistogramExplorer({
 }) {
   const pairs = useMemo(() => finiteMetricPairs(analysis.samples, metric), [analysis.samples, metric]);
   const values = useMemo(() => pairs.map((pair) => pair.value), [pairs]);
-  const dataMin = values.length ? Math.min(...values) : 0;
-  const dataMax = values.length ? Math.max(...values) : 1;
+  const { min: dataMin, max: dataMax } = useMemo(() => numericBounds(values), [values]);
   const [xMin, setXMin] = useState<number | null>(null);
   const [xMax, setXMax] = useState<number | null>(null);
   const [binWidth, setBinWidth] = useState<number | null>(null);
+  const effectiveXMin = xMin ?? dataMin;
+  const effectiveXMax = xMax ?? dataMax;
   const bins = useMemo(
-    () => histogramByWidth(values, xMin, xMax, binWidth),
-    [binWidth, values, xMax, xMin]
+    () => histogramByWidth(values, effectiveXMin, effectiveXMax, binWidth),
+    [binWidth, effectiveXMax, effectiveXMin, values]
   );
   const [activeBin, setActiveBin] = useState<AnalysisDistributionBin | null>(null);
   const maxCount = Math.max(1, ...bins.map((bin) => bin.count));
@@ -467,7 +741,8 @@ function HistogramExplorer({
     onPreview({
       title: `${metricLabel(metric)} ${metricValue(metric, bin.start)} - ${metricValue(metric, bin.end)}`,
       detail: `${ids.length.toLocaleString()} curves in bin`,
-      ids
+      ids,
+      focusCurveId: null
     });
   }
 
@@ -487,9 +762,9 @@ function HistogramExplorer({
               ))}
             </select>
           </label>
-          <label>X min<input type="number" value={xMin ?? ""} placeholder={String(Number(dataMin.toPrecision(4)))} onChange={(event) => setXMin(event.target.value ? Number(event.target.value) : null)} /></label>
-          <label>X max<input type="number" value={xMax ?? ""} placeholder={String(Number(dataMax.toPrecision(4)))} onChange={(event) => setXMax(event.target.value ? Number(event.target.value) : null)} /></label>
-          <label>Bin width<input type="number" min="0" value={binWidth ?? ""} placeholder="auto" onChange={(event) => setBinWidth(event.target.value ? Number(event.target.value) : null)} /></label>
+          <label>X min<CommitNumberInput value={xMin} fallback={dataMin} onCommit={setXMin} /></label>
+          <label>X max<CommitNumberInput value={xMax} fallback={dataMax} onCommit={setXMax} /></label>
+          <label>Bin width<CommitNumberInput value={binWidth} min={0} placeholder="auto" onCommit={setBinWidth} normalize={clampPositive} /></label>
         </div>
       </div>
       <Plot
@@ -516,7 +791,12 @@ function PreviewPanel({ request }: { request: PreviewRequest }) {
   const [xMin, setXMin] = useState<number | null>(null);
   const [xMax, setXMax] = useState<number | null>(null);
   const [hoveredCurveId, setHoveredCurveId] = useState<string | null>(null);
-  const ids = useMemo(() => [...new Set(request.ids)].slice(0, PREVIEW_CURVE_LIMIT), [request.ids]);
+  const ids = useMemo(() => {
+    const ordered = request.focusCurveId
+      ? [request.focusCurveId, ...request.ids.filter((id) => id !== request.focusCurveId)]
+      : request.ids;
+    return [...new Set(ordered)].slice(0, PREVIEW_CURVE_LIMIT);
+  }, [request.focusCurveId, request.ids]);
 
   useEffect(() => {
     if (ids.length === 0) {
@@ -550,15 +830,17 @@ function PreviewPanel({ request }: { request: PreviewRequest }) {
     setXMin(null);
     setXMax(null);
     setHoveredCurveId(null);
-  }, [request.ids]);
+  }, [request.ids, request.focusCurveId]);
 
   const allX = useMemo(
     () => details.flatMap((detail) => detail.raw_points.map((point) => point.voltage_v)),
     [details]
   );
-  const previewXMin = allX.length > 0 ? Math.min(...allX) : null;
-  const previewXMax = allX.length > 0 ? Math.max(...allX) : null;
+  const { min: previewXMin, max: previewXMax } = useMemo(() => numericBounds(allX), [allX]);
+  const effectiveXMin = xMin ?? previewXMin;
+  const effectiveXMax = xMax ?? previewXMax;
 
+  const activeCurveId = hoveredCurveId ?? request.focusCurveId;
   const traces: Data[] = details.map((detail, index) => ({
     type: "scatter",
     mode: "lines",
@@ -571,14 +853,14 @@ function PreviewPanel({ request }: { request: PreviewRequest }) {
     line: {
       color: colorFor(detail.polarity || String(index)),
       width:
-        hoveredCurveId === detail.curve_id
+        activeCurveId === detail.curve_id
           ? 3.2
           : details.length > 10
             ? 1.2
             : 1.8
     },
     opacity:
-      hoveredCurveId === null || hoveredCurveId === detail.curve_id
+      activeCurveId === null || activeCurveId === detail.curve_id
         ? details.length > 10 ? 0.56 : 0.8
         : 0.18,
     hovertemplate: `${detail.curve_id}<br>Vg %{x:.3g} V<br>log |Id| %{y:.3g}<extra></extra>`
@@ -596,7 +878,7 @@ function PreviewPanel({ request }: { request: PreviewRequest }) {
       gridcolor: "#eef2f7",
       linecolor: "#9cabc0",
       ticks: "outside",
-      range: xMin !== null && xMax !== null && xMax > xMin ? [xMin, xMax] : undefined
+      range: resolvedRange(effectiveXMin, effectiveXMax)
     },
     yaxis: {
       title: { text: "log10 |Id|", standoff: 8 },
@@ -615,8 +897,8 @@ function PreviewPanel({ request }: { request: PreviewRequest }) {
           <h2>{request.title}</h2>
         </div>
         <div className="analysis-control-row analysis-control-row-compact">
-          <label>X min<input type="number" value={xMin ?? ""} placeholder={previewXMin === null ? "" : String(Number(previewXMin.toPrecision(4)))} onChange={(event) => setXMin(event.target.value ? Number(event.target.value) : null)} /></label>
-          <label>X max<input type="number" value={xMax ?? ""} placeholder={previewXMax === null ? "" : String(Number(previewXMax.toPrecision(4)))} onChange={(event) => setXMax(event.target.value ? Number(event.target.value) : null)} /></label>
+          <label>X min<CommitNumberInput value={xMin} fallback={previewXMin} onCommit={setXMin} /></label>
+          <label>X max<CommitNumberInput value={xMax} fallback={previewXMax} onCommit={setXMax} /></label>
         </div>
       </div>
       <span className="analysis-subtle">
@@ -670,6 +952,7 @@ function ScatterExplorer({
   const [yMin, setYMin] = useState<number | null>(null);
   const [yMax, setYMax] = useState<number | null>(null);
   const [openAxisMenu, setOpenAxisMenu] = useState<"x" | "y" | null>(null);
+  const axisMenuRef = useRef<HTMLDivElement | null>(null);
   const availableMetrics = useMemo(
     () => METRIC_OPTIONS.filter((option) => analysis.metrics[option]),
     [analysis.metrics]
@@ -683,29 +966,52 @@ function ScatterExplorer({
     () => sampleEvenly(correlation.points, ANALYSIS_SCATTER_RENDER_LIMIT),
     [correlation.points]
   );
+  const { min: dataXMin, max: dataXMax } = useMemo(
+    () => numericBounds(renderPoints.map((point) => point.x)),
+    [renderPoints]
+  );
+  const { min: dataYMin, max: dataYMax } = useMemo(
+    () => numericBounds(renderPoints.map((point) => point.y)),
+    [renderPoints]
+  );
+  const effectiveXMin = xMin ?? dataXMin;
+  const effectiveXMax = xMax ?? dataXMax;
+  const effectiveYMin = yMin ?? dataYMin;
+  const effectiveYMax = yMax ?? dataYMax;
+  useEffect(() => {
+    setOpenAxisMenu(null);
+    setXMin(null);
+    setXMax(null);
+    setYMin(null);
+    setYMax(null);
+  }, [xMetric, yMetric]);
+  useEffect(() => {
+    if (openAxisMenu === null) return undefined;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!axisMenuRef.current?.contains(event.target as Node)) setOpenAxisMenu(null);
+    };
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => window.removeEventListener("pointerdown", handlePointerDown);
+  }, [openAxisMenu]);
+  const filteredPoints = useMemo(
+    () =>
+      renderPoints.filter((point) => {
+        if (effectiveXMin !== null && point.x < effectiveXMin) return false;
+        if (effectiveXMax !== null && point.x > effectiveXMax) return false;
+        if (effectiveYMin !== null && point.y < effectiveYMin) return false;
+        if (effectiveYMax !== null && point.y > effectiveYMax) return false;
+        return true;
+      }),
+    [effectiveXMax, effectiveXMin, effectiveYMax, effectiveYMin, renderPoints]
+  );
   const groups = useMemo(() => {
-    const buckets = new Map<string, typeof correlation.points>();
-    renderPoints.forEach((point) => {
+    const buckets = new Map<string, typeof filteredPoints>();
+    filteredPoints.forEach((point) => {
       const label = String(point.sample[colorBy]);
       buckets.set(label, [...(buckets.get(label) ?? []), point]);
     });
     return [...buckets.entries()].sort(([a], [b]) => a.localeCompare(b));
-  }, [colorBy, renderPoints]);
-  const filteredPoints = useMemo(
-    () =>
-      renderPoints.filter((point) => {
-        if (xMin !== null && point.x < xMin) return false;
-        if (xMax !== null && point.x > xMax) return false;
-        if (yMin !== null && point.y < yMin) return false;
-        if (yMax !== null && point.y > yMax) return false;
-        return true;
-      }),
-    [renderPoints, xMax, xMin, yMax, yMin]
-  );
-  const filteredIds = useMemo(
-    () => new Set(filteredPoints.map((point) => point.sample.curve_id)),
-    [filteredPoints]
-  );
+  }, [colorBy, filteredPoints]);
   const xValues = filteredPoints.map((point) => point.x);
   const yValues = filteredPoints.map((point) => point.y);
   const xHist = histogramBins(xValues, 24);
@@ -734,21 +1040,15 @@ function ScatterExplorer({
   const scatterTraces: Data[] = groups.map(([label, points]) => ({
     type: "scatter",
     mode: "markers",
-    x: points
-      .filter((point) => filteredIds.has(point.sample.curve_id))
-      .map((point) => point.x),
-    y: points
-      .filter((point) => filteredIds.has(point.sample.curve_id))
-      .map((point) => point.y),
-    customdata: points
-      .filter((point) => filteredIds.has(point.sample.curve_id))
-      .map((point) => point.sample.curve_id),
+    x: points.map((point) => point.x),
+    y: points.map((point) => point.y),
+    customdata: points.map((point) => point.sample.curve_id),
     name: label,
     marker: {
       color: colorFor(label),
-      size: 7,
-      opacity: 0.72,
-      line: { color: "#ffffff", width: 0.5 }
+      size: 7.5,
+      opacity: 0.74,
+      line: { color: "#ffffff", width: 0.6 }
     },
     hovertemplate: `%{customdata}<br>${metricLabel(xMetric)} %{x:.3g}<br>${metricLabel(yMetric)} %{y:.3g}<extra>${label}</extra>`
   } as Data));
@@ -763,7 +1063,8 @@ function ScatterExplorer({
       yaxis: "y2",
       marker: { color: "rgba(111, 153, 212, 0.52)" },
       hoverinfo: "skip",
-      showlegend: false
+      showlegend: false,
+      cliponaxis: false
     } as Data,
     {
       type: "scatter",
@@ -812,7 +1113,14 @@ function ScatterExplorer({
     plot_bgcolor: "#fbfdff",
     font: { family: "Segoe UI, system-ui, sans-serif", color: "#263a55", size: 10 },
     showlegend: true,
-    legend: { orientation: "v", x: 1.02, y: 0, yanchor: "bottom", font: { size: 9 } },
+    legend: {
+      orientation: "h",
+      x: 0,
+      y: -0.16,
+      yanchor: "top",
+      font: { size: 9 },
+      bgcolor: "rgba(255,255,255,0.82)"
+    },
     dragmode: "select",
     xaxis: {
       domain: [0, 0.78],
@@ -821,7 +1129,7 @@ function ScatterExplorer({
       linecolor: "#9cabc0",
       zeroline: false,
       ticks: "outside",
-      range: xMin !== null && xMax !== null && xMax > xMin ? [xMin, xMax] : undefined
+      range: resolvedRange(effectiveXMin, effectiveXMax)
     },
     yaxis: {
       domain: [0, 0.72],
@@ -830,7 +1138,7 @@ function ScatterExplorer({
       linecolor: "#9cabc0",
       zeroline: false,
       ticks: "outside",
-      range: yMin !== null && yMax !== null && yMax > yMin ? [yMin, yMax] : undefined
+      range: resolvedRange(effectiveYMin, effectiveYMax)
     },
     yaxis2: {
       domain: [0.8, 1],
@@ -853,7 +1161,8 @@ function ScatterExplorer({
     onPreview({
       title: label,
       detail: `${ids.length.toLocaleString()} curves`,
-      ids
+      ids,
+      focusCurveId: null
     });
   }
 
@@ -877,13 +1186,23 @@ function ScatterExplorer({
           <ScatterChart size={16} />
           <h2>Scatter correlation</h2>
         </div>
-        <div className="analysis-control-row analysis-control-row-grid">
-          <label>X min<input type="number" value={xMin ?? ""} onChange={(event) => setXMin(event.target.value ? Number(event.target.value) : null)} /></label>
-          <label>X max<input type="number" value={xMax ?? ""} onChange={(event) => setXMax(event.target.value ? Number(event.target.value) : null)} /></label>
-          <label>Y min<input type="number" value={yMin ?? ""} onChange={(event) => setYMin(event.target.value ? Number(event.target.value) : null)} /></label>
-          <label>Y max<input type="number" value={yMax ?? ""} onChange={(event) => setYMax(event.target.value ? Number(event.target.value) : null)} /></label>
-          <label className="analysis-color-control analysis-color-control-inline">
-            Color
+        <div className="analysis-control-row analysis-control-row-scatter">
+          <label>X range
+            <div className="analysis-range-inline">
+              <CommitNumberInput value={xMin} fallback={dataXMin} onCommit={setXMin} />
+              <span>to</span>
+              <CommitNumberInput value={xMax} fallback={dataXMax} onCommit={setXMax} />
+            </div>
+          </label>
+          <label>Y range
+            <div className="analysis-range-inline">
+              <CommitNumberInput value={yMin} fallback={dataYMin} onCommit={setYMin} />
+              <span>to</span>
+              <CommitNumberInput value={yMax} fallback={dataYMax} onCommit={setYMax} />
+            </div>
+          </label>
+          <label className="analysis-color-pill">
+            <span>Color</span>
             <select value={colorBy} onChange={(event) => setColorBy(event.target.value as typeof colorBy)}>
               <option value="polarity">Polarity</option>
               <option value="source_kind">Source</option>
@@ -892,13 +1211,13 @@ function ScatterExplorer({
           </label>
         </div>
       </div>
-      <div className="analysis-scatter-shell">
-        <div className="analysis-axis-title analysis-axis-title-y">
+      <div ref={axisMenuRef} className="analysis-scatter-shell">
+        <div className="analysis-axis-trigger analysis-axis-trigger-y">
           <button type="button" onClick={() => setOpenAxisMenu((current) => current === "y" ? null : "y")}>
             {metricLabel(yMetric)}
           </button>
           {openAxisMenu === "y" ? (
-            <div className="analysis-axis-menu">
+            <div className="analysis-axis-menu analysis-axis-menu-y">
               {availableMetrics.map((option) => (
                 <button
                   key={`y-${option}`}
@@ -924,12 +1243,12 @@ function ScatterExplorer({
           onSelected={handleSelected}
           onClick={handleClick}
         />
-        <div className="analysis-axis-title analysis-axis-title-x">
+        <div className="analysis-axis-trigger analysis-axis-trigger-x">
           <button type="button" onClick={() => setOpenAxisMenu((current) => current === "x" ? null : "x")}>
             {metricLabel(xMetric)}
           </button>
           {openAxisMenu === "x" ? (
-            <div className="analysis-axis-menu">
+            <div className="analysis-axis-menu analysis-axis-menu-x">
               {availableMetrics.map((option) => (
                 <button
                   key={`x-${option}`}
@@ -959,8 +1278,7 @@ function ScatterExplorer({
 }
 
 function CorrelationPanel({ analysis }: { analysis: DatabaseAnalysisResponse }) {
-  const [hoveredCell, setHoveredCell] = useState<{ row: number; column: number } | null>(null);
-  const [pinnedCell, setPinnedCell] = useState<{ row: number; column: number } | null>(null);
+  const [correlationOrder, setCorrelationOrder] = useState(1);
 
   const orderedIndexes = useMemo(() => {
     const features = analysis.correlations.features;
@@ -1001,133 +1319,154 @@ function CorrelationPanel({ analysis }: { analysis: DatabaseAnalysisResponse }) 
   }, [analysis.correlations.features, analysis.correlations.matrix]);
 
   const orderedFeatures = orderedIndexes.map((index) => analysis.correlations.features[index]);
-  const labels = orderedFeatures.map(metricLabel);
-  const orderedMatrix = orderedIndexes.map((rowIndex) =>
-    orderedIndexes.map((columnIndex) => analysis.correlations.matrix[rowIndex]?.[columnIndex] ?? null)
+  const orderedMatrix = useMemo(
+    () =>
+      orderedIndexes.map((rowIndex) =>
+        orderedIndexes.map((columnIndex) => analysis.correlations.matrix[rowIndex]?.[columnIndex] ?? null)
+      ),
+    [analysis.correlations.matrix, orderedIndexes]
   );
-  const orderedCounts = orderedIndexes.map((rowIndex) =>
-    orderedIndexes.map((columnIndex) => analysis.correlations.counts[rowIndex]?.[columnIndex] ?? 0)
+  const poweredMatrix = useMemo(
+    () => correlationMatrixForOrder(orderedMatrix, correlationOrder),
+    [correlationOrder, orderedMatrix]
   );
-
-  const activeCell = pinnedCell ?? hoveredCell;
-  const activeRowMetric = activeCell ? orderedFeatures[activeCell.row] ?? null : null;
-  const activeColMetric = activeCell ? orderedFeatures[activeCell.column] ?? null : null;
-  const activeValue = activeCell ? orderedMatrix[activeCell.row]?.[activeCell.column] ?? null : null;
-  const activeCount = activeCell ? orderedCounts[activeCell.row]?.[activeCell.column] ?? 0 : 0;
-
-  const strongestPairs = useMemo(() => {
-    const sourceMetric = activeRowMetric ?? orderedFeatures[0] ?? null;
-    if (!sourceMetric) return [] as Array<{ other: string; r: number; count: number }>;
-    const metricIndex = orderedFeatures.indexOf(sourceMetric);
-    if (metricIndex < 0) return [];
-    return orderedFeatures
-      .map((feature, index) => ({
-        other: feature,
-        r: orderedMatrix[metricIndex]?.[index] ?? null,
-        count: orderedCounts[metricIndex]?.[index] ?? 0
-      }))
-      .filter(
-        (item): item is { other: string; r: number; count: number } =>
-          item.r !== null && item.other !== sourceMetric
-      )
-      .sort((left, right) => Math.abs(right.r) - Math.abs(left.r))
-      .slice(0, 5);
-  }, [activeRowMetric, orderedCounts, orderedFeatures, orderedMatrix]);
-
-  const textMatrix = orderedMatrix.map((row, rowIndex) =>
-    row.map((value, columnIndex) => {
-      if (value === null) return "";
-      return rowIndex === columnIndex || Math.abs(value) >= 0.6 ? fixed(value, 2) : "";
+  const squareSize = Math.max(18, Math.min(28, 260 / Math.max(orderedFeatures.length, 1)));
+  const diagonalCells = orderedFeatures.map((feature) => ({
+    x: metricLabel(feature),
+    y: metricLabel(feature),
+    text: '1.00'
+  }));
+  const upperTriangleCells = orderedFeatures.flatMap((rowFeature, rowIndex) =>
+    orderedFeatures.flatMap((columnFeature, columnIndex) => {
+      if (columnIndex <= rowIndex) return [];
+      const value = poweredMatrix[rowIndex]?.[columnIndex] ?? 0;
+      return [{
+        x: metricLabel(columnFeature),
+        y: metricLabel(rowFeature),
+        value
+      }];
+    })
+  );
+  const offDiagonalCells = orderedFeatures.flatMap((rowFeature, rowIndex) =>
+    orderedFeatures.flatMap((columnFeature, columnIndex) => {
+      if (columnIndex >= rowIndex) return [];
+      const value = poweredMatrix[rowIndex]?.[columnIndex] ?? 0;
+      return [{
+        x: metricLabel(columnFeature),
+        y: metricLabel(rowFeature),
+        value,
+        text: Math.abs(value) >= 0.68 ? fixed(value, 2) : ''
+      }];
     })
   );
 
   const heatmapData: Data[] = [
     {
-      type: "heatmap",
-      x: labels,
-      y: labels,
-      z: orderedMatrix.map((row) => row.map((value) => value ?? null)),
-      text: textMatrix,
-      texttemplate: "%{text}",
-      textfont: { size: 9, color: "#20334d" },
-      xgap: 2,
-      ygap: 2,
-      zmin: -1,
-      zmax: 1,
-      zmid: 0,
-      colorscale: [
-        [0, "#1d5fd1"],
-        [0.5, "#f8fbff"],
-        [1, "#cb2f69"]
-      ],
-      colorbar: {
-        title: { text: "r", side: "right" },
-        thickness: 14,
-        len: 0.84,
-        tickvals: [-1, -0.5, 0, 0.5, 1]
+      type: 'scatter',
+      mode: 'markers',
+      x: diagonalCells.map((cell) => cell.x),
+      y: diagonalCells.map((cell) => cell.y),
+      marker: {
+        symbol: 'square',
+        size: squareSize,
+        color: '#eef2f7',
+        line: { color: '#ffffff', width: 1 }
       },
-      customdata: orderedCounts.map((row, rowIndex) =>
-        row.map((count, columnIndex) => [
-          orderedFeatures[rowIndex],
-          orderedFeatures[columnIndex],
-          count
-        ])
-      ),
-      hovertemplate:
-        "<b>%{customdata[0]}</b> vs <b>%{customdata[1]}</b><br>" +
-        "r = %{z:.3f}<br>" +
-        "N = %{customdata[2]}<extra></extra>"
-    } as unknown as Data
+      hoverinfo: 'skip',
+      showlegend: false
+    } as Data,
+    {
+      type: 'scatter',
+      mode: 'markers',
+      x: upperTriangleCells.map((cell) => cell.x),
+      y: upperTriangleCells.map((cell) => cell.y),
+      marker: {
+        symbol: 'circle',
+        size: upperTriangleCells.map((cell) => 4 + Math.abs(cell.value) * (squareSize - 6)),
+        color: upperTriangleCells.map((cell) =>
+          cell.value >= 0 ? 'rgba(203, 47, 105, 0.68)' : 'rgba(29, 95, 209, 0.68)'
+        ),
+        line: {
+          color: '#ffffff',
+          width: 0.8
+        }
+      },
+      hovertemplate: '<b>%{y}</b> vs <b>%{x}</b><br>|value| = %{marker.size:.1f}px<br>value = %{customdata:.3f}<extra></extra>',
+      customdata: upperTriangleCells.map((cell) => cell.value),
+      showlegend: false
+    } as Data,
+    {
+      type: 'scatter',
+      mode: 'markers',
+      x: offDiagonalCells.map((cell) => cell.x),
+      y: offDiagonalCells.map((cell) => cell.y),
+      marker: {
+        symbol: 'square',
+        size: squareSize,
+        color: offDiagonalCells.map((cell) => cell.value),
+        cmin: -1,
+        cmax: 1,
+        colorscale: [
+          [0, '#1d5fd1'],
+          [0.5, '#ffffff'],
+          [1, '#cb2f69']
+        ],
+        line: { color: '#ffffff', width: 1 },
+        colorbar: {
+          title: { text: correlationOrder === 1 ? 'r' : `order ${correlationOrder}`, side: 'right' },
+          thickness: 12,
+          len: 0.82,
+          tickvals: [-1, -0.5, 0, 0.5, 1]
+        }
+      },
+      hovertemplate: '<b>%{y}</b> vs <b>%{x}</b><br>value = %{marker.color:.3f}<extra></extra>',
+      showlegend: false
+    } as Data,
+    {
+      type: 'scatter',
+      mode: 'text',
+      x: [
+        ...diagonalCells.map((cell) => cell.x),
+        ...offDiagonalCells.filter((cell) => cell.text).map((cell) => cell.x)
+      ],
+      y: [
+        ...diagonalCells.map((cell) => cell.y),
+        ...offDiagonalCells.filter((cell) => cell.text).map((cell) => cell.y)
+      ],
+      text: [
+        ...diagonalCells.map((cell) => cell.text),
+        ...offDiagonalCells.filter((cell) => cell.text).map((cell) => cell.text)
+      ],
+      textfont: { size: 9, color: '#20334d' },
+      hoverinfo: 'skip',
+      showlegend: false
+    } as Data
   ];
 
   const heatmapLayout: Partial<Layout> = {
     autosize: true,
-    margin: { l: 92, r: 38, t: 18, b: 84 },
-    paper_bgcolor: "#ffffff",
-    plot_bgcolor: "#fbfdff",
-    font: { family: "Segoe UI, system-ui, sans-serif", color: "#263a55", size: 10 },
+    margin: { l: 92, r: 56, t: 18, b: 84 },
+    paper_bgcolor: '#ffffff',
+    plot_bgcolor: '#fbfdff',
+    font: { family: 'Segoe UI, system-ui, sans-serif', color: '#263a55', size: 10 },
     xaxis: {
-      side: "top",
+      side: 'top',
       tickangle: -35,
       automargin: true,
-      tickfont: { size: 10 }
+      tickfont: { size: 10 },
+      showgrid: false,
+      zeroline: false
     },
     yaxis: {
       automargin: true,
-      autorange: "reversed",
+      autorange: 'reversed',
       tickfont: { size: 10 },
-      scaleanchor: "x",
-      scaleratio: 1
+      scaleanchor: 'x',
+      scaleratio: 1,
+      showgrid: false,
+      zeroline: false
     }
   };
-
-  function focusMetric(metric: string) {
-    const index = orderedFeatures.indexOf(metric);
-    if (index < 0) return;
-    setPinnedCell({ row: index, column: index });
-  }
-
-  function handleHeatmapClick(event?: Readonly<PlotMouseEvent>) {
-    const point = event?.points?.[0] as
-      | { pointNumber?: [number, number] | number[] }
-      | undefined;
-    const pair = point?.pointNumber;
-    if (!pair || pair.length < 2) return;
-    const [row, column] = pair;
-    setPinnedCell((current) =>
-      current?.row === row && current?.column === column ? null : { row, column }
-    );
-  }
-
-  function handleHeatmapHover(event?: Readonly<PlotMouseEvent>) {
-    const point = event?.points?.[0] as
-      | { pointNumber?: [number, number] | number[] }
-      | undefined;
-    const pair = point?.pointNumber;
-    if (!pair || pair.length < 2) return;
-    const [row, column] = pair;
-    setHoveredCell({ row, column });
-  }
 
   return (
     <section className="analysis-chart-panel analysis-correlation-panel">
@@ -1143,343 +1482,295 @@ function CorrelationPanel({ analysis }: { analysis: DatabaseAnalysisResponse }) 
           <b />
           <span>Positive</span>
         </div>
-        <div className="analysis-correlation-focus">
-          {activeCell ? (
-            <>
-              <strong>{metricLabel(activeRowMetric ?? "")} / {metricLabel(activeColMetric ?? "")}</strong>
-              <span>{activeValue === null ? "No usable overlap" : `r ${fixed(activeValue, 3)} · N ${activeCount.toLocaleString()}`}</span>
-            </>
-          ) : (
-            <span>Hover a cell to inspect one pair. Click to pin it and compare its strongest links.</span>
-          )}
-        </div>
+        <label className="analysis-correlation-order">
+          <span>Order</span>
+          <CommitNumberInput
+            min={1}
+            max={6}
+            step={1}
+            value={correlationOrder}
+            onCommit={(value) => setCorrelationOrder(clampInteger(value, 1, 6) ?? 1)}
+          />
+        </label>
       </div>
-      <div className="analysis-correlation-layout">
-        <div
-          className="analysis-correlation-plot-wrap"
-          onMouseLeave={() => setHoveredCell(null)}
-        >
+      <div className="analysis-correlation-layout analysis-correlation-layout-simple">
+        <div className="analysis-correlation-plot-wrap">
           <Plot
             data={heatmapData}
             layout={heatmapLayout}
             config={plotConfig(false)}
             useResizeHandler
             className="analysis-plot analysis-correlation-plot"
-            onHover={handleHeatmapHover}
-            onClick={handleHeatmapClick}
           />
         </div>
-        <div className="analysis-correlation-detail">
-          {activeCell ? (
-            <>
-              <strong>{metricLabel(activeRowMetric ?? "")} / {metricLabel(activeColMetric ?? "")}</strong>
-              <b>{activeValue === null ? "NA" : fixed(activeValue, 3)}</b>
-              <span>
-                {activeValue === null
-                  ? "This pair does not have enough finite values."
-                  : activeValue >= 0
-                    ? "Positive relationship across the filtered population."
-                    : "Negative relationship across the filtered population."}
-              </span>
-            </>
-          ) : (
-            <>
-              <strong>Interactive heatmap</strong>
-              <span>
-                The matrix is reordered by correlation structure so related metrics stay visually grouped.
-              </span>
-            </>
-          )}
-          {strongestPairs.map((pair) => (
-            <button
-              key={`${activeRowMetric ?? "seed"}-${pair.other}`}
-              type="button"
-              className="analysis-correlation-pair"
-              onClick={() => focusMetric(pair.other)}
-            >
-              <span>{metricLabel(pair.other)}</span>
-              <b>{fixed(pair.r, 3)}</b>
-            </button>
-          ))}
-        </div>
+      </div>
+      <div className="analysis-inline-stats analysis-inline-stats-wrap">
+        <span>Diagonal self-correlation is shown in light gray.</span>
+        <span>Zero correlation is white. The colorbar stays symmetric from -1 to 1.</span>
       </div>
     </section>
   );
 }
-
-type NetworkNode = {
-  id: string;
-  label: string;
-  degree: number;
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-};
-
-type NetworkEdge = {
-  source: string;
-  target: string;
-  r: number;
-};
-
-function buildCorrelationNetwork(
-  analysis: DatabaseAnalysisResponse,
-  threshold: number
-): { nodes: NetworkNode[]; edges: NetworkEdge[] } {
-  const nodes = analysis.correlations.features.map((feature, index) => ({
-    id: feature,
-    label: metricLabel(feature),
-    degree: 0,
-    x: 0.5 + Math.cos((Math.PI * 2 * index) / Math.max(analysis.correlations.features.length, 1)) * 0.28,
-    y: 0.5 + Math.sin((Math.PI * 2 * index) / Math.max(analysis.correlations.features.length, 1)) * 0.28,
-    vx: 0,
-    vy: 0
-  }));
-  const edges: NetworkEdge[] = [];
-  analysis.correlations.matrix.forEach((row, rowIndex) => {
-    row.forEach((value, columnIndex) => {
-      if (columnIndex <= rowIndex || value === null || Math.abs(value) < threshold) return;
-      edges.push({
-        source: analysis.correlations.features[rowIndex],
-        target: analysis.correlations.features[columnIndex],
-        r: value
-      });
-    });
-  });
-  const degreeById = new Map<string, number>();
-  edges.forEach((edge) => {
-    degreeById.set(edge.source, (degreeById.get(edge.source) ?? 0) + 1);
-    degreeById.set(edge.target, (degreeById.get(edge.target) ?? 0) + 1);
-  });
-  return {
-    nodes: nodes.map((node) => ({ ...node, degree: degreeById.get(node.id) ?? 0 })),
-    edges
-  };
-}
-
-function CorrelationNetworkPanel({ analysis }: { analysis: DatabaseAnalysisResponse }) {
-  const [threshold, setThreshold] = useState(0.45);
-  const [activeNode, setActiveNode] = useState<string | null>(null);
-  const baseNetwork = useMemo(() => buildCorrelationNetwork(analysis, threshold), [analysis, threshold]);
-  const [nodes, setNodes] = useState<NetworkNode[]>(baseNetwork.nodes);
-  const svgRef = useRef<SVGSVGElement | null>(null);
-  const dragRef = useRef<string | null>(null);
+function BinnedViolinPanel({
+  analysis,
+  onPreview
+}: {
+  analysis: DatabaseAnalysisResponse;
+  onPreview: (request: PreviewRequest) => void;
+}) {
+  const metricOptions = useMemo(
+    () => RAW_METRIC_OPTIONS.filter((option) => analysis.metrics[option]),
+    [analysis.metrics]
+  );
+  const [xMetric, setXMetric] = useState("vth");
+  const [yMetric, setYMetric] = useState("logRatio");
+  const [binCount, setBinCount] = useState(6);
+  const allPairs = useMemo(
+    () =>
+      analysis.samples.flatMap((sample) => {
+        const x = sampleMetric(sample, xMetric);
+        const y = sampleMetric(sample, yMetric);
+        return x === null || y === null ? [] : [{ sample, x, y }];
+      }),
+    [analysis.samples, xMetric, yMetric]
+  );
+  const { min: dataXMin, max: dataXMax } = useMemo(
+    () => numericBounds(allPairs.map((pair) => pair.x)),
+    [allPairs]
+  );
+  const { min: dataYMin, max: dataYMax } = useMemo(
+    () => numericBounds(allPairs.map((pair) => pair.y)),
+    [allPairs]
+  );
+  const [xMin, setXMin] = useState<number | null>(null);
+  const [xMax, setXMax] = useState<number | null>(null);
+  const [yMin, setYMin] = useState<number | null>(null);
+  const [yMax, setYMax] = useState<number | null>(null);
+  const effectiveXMin = xMin ?? dataXMin;
+  const effectiveXMax = xMax ?? dataXMax;
+  const effectiveYMin = yMin ?? dataYMin;
+  const effectiveYMax = yMax ?? dataYMax;
 
   useEffect(() => {
-    setNodes(baseNetwork.nodes);
-    setActiveNode(null);
-  }, [baseNetwork]);
+    setXMin(null);
+    setXMax(null);
+    setYMin(null);
+    setYMax(null);
+  }, [xMetric, yMetric]);
 
-  useEffect(() => {
-    let frame = 0;
-    let cancelled = false;
-
-    const step = () => {
-      setNodes((current) => {
-        const indexById = new Map(current.map((node, index) => [node.id, index]));
-        const next = current.map((node) => ({ ...node }));
-        next.forEach((node, index) => {
-          if (dragRef.current === node.id) {
-            node.vx = 0;
-            node.vy = 0;
-            return;
-          }
-          let fx = 0;
-          let fy = 0;
-          next.forEach((other, otherIndex) => {
-            if (index === otherIndex) return;
-            const dx = node.x - other.x;
-            const dy = node.y - other.y;
-            const dist = Math.max(0.001, Math.sqrt(dx * dx + dy * dy));
-            const repel = 0.0013 / (dist * dist);
-            fx += (dx / dist) * repel;
-            fy += (dy / dist) * repel;
-          });
-          baseNetwork.edges.forEach((edge) => {
-            if (edge.source !== node.id && edge.target !== node.id) return;
-            const otherIndex = indexById.get(edge.source === node.id ? edge.target : edge.source);
-            if (otherIndex === undefined) return;
-            const other = next[otherIndex];
-            const dx = other.x - node.x;
-            const dy = other.y - node.y;
-            const dist = Math.max(0.001, Math.sqrt(dx * dx + dy * dy));
-            const spring = (dist - 0.22) * 0.026 * (0.65 + Math.abs(edge.r));
-            fx += (dx / dist) * spring;
-            fy += (dy / dist) * spring;
-          });
-          fx += (0.5 - node.x) * 0.004;
-          fy += (0.5 - node.y) * 0.004;
-          node.vx = (node.vx + fx) * 0.84;
-          node.vy = (node.vy + fy) * 0.84;
-        });
-        next.forEach((node) => {
-          if (dragRef.current === node.id) return;
-          node.x = Math.min(0.92, Math.max(0.08, node.x + node.vx));
-          node.y = Math.min(0.92, Math.max(0.08, node.y + node.vy));
-        });
-        return next;
-      });
-      if (!cancelled) frame = window.requestAnimationFrame(step);
-    };
-
-    frame = window.requestAnimationFrame(step);
-    return () => {
-      cancelled = true;
-      window.cancelAnimationFrame(frame);
-    };
-  }, [baseNetwork.edges]);
-
-  useEffect(() => {
-    function updateDrag(clientX: number, clientY: number) {
-      const draggingId = dragRef.current;
-      const svg = svgRef.current;
-      if (!draggingId || !svg) return;
-      const bounds = svg.getBoundingClientRect();
-      const x = Math.min(0.92, Math.max(0.08, (clientX - bounds.left) / Math.max(bounds.width, 1)));
-      const y = Math.min(0.92, Math.max(0.08, (clientY - bounds.top) / Math.max(bounds.height, 1)));
-      setNodes((current) =>
-        current.map((node) =>
-          node.id === draggingId ? { ...node, x, y, vx: 0, vy: 0 } : node
-        )
-      );
+  const bins = useMemo(() => {
+    if (
+      effectiveXMin === null ||
+      effectiveXMax === null ||
+      effectiveXMax <= effectiveXMin ||
+      binCount < 1
+    ) {
+      return [] as Array<{
+        label: string;
+        start: number;
+        end: number;
+        points: typeof allPairs;
+      }>;
     }
+    const width = (effectiveXMax - effectiveXMin) / binCount;
+    return Array.from({ length: binCount }, (_, index) => {
+      const start = effectiveXMin + index * width;
+      const end = index === binCount - 1 ? effectiveXMax : start + width;
+      const points = allPairs.filter((pair) => {
+        if (pair.x < start || pair.x > end) return false;
+        if (effectiveYMin !== null && pair.y < effectiveYMin) return false;
+        if (effectiveYMax !== null && pair.y > effectiveYMax) return false;
+        return index === binCount - 1 ? pair.x <= end : pair.x < end;
+      });
+      return {
+        label: `${fixed(start, 2)}-${fixed(end, 2)}`,
+        start,
+        end,
+        points
+      };
+    }).filter((bin) => bin.points.length > 0);
+  }, [allPairs, binCount, effectiveXMax, effectiveXMin, effectiveYMax, effectiveYMin]);
 
-    const handleMove = (event: PointerEvent) => updateDrag(event.clientX, event.clientY);
-    const handleUp = () => {
-      dragRef.current = null;
-    };
-    window.addEventListener("pointermove", handleMove);
-    window.addEventListener("pointerup", handleUp);
-    return () => {
-      window.removeEventListener("pointermove", handleMove);
-      window.removeEventListener("pointerup", handleUp);
-    };
-  }, []);
-
-  const connectedIds = useMemo(() => {
-    if (activeNode === null) return new Set<string>();
-    const ids = new Set<string>([activeNode]);
-    baseNetwork.edges.forEach((edge) => {
-      if (edge.source === activeNode) ids.add(edge.target);
-      if (edge.target === activeNode) ids.add(edge.source);
+  const yFloor = effectiveYMin ?? dataYMin ?? 0;
+  const yCeiling = effectiveYMax ?? dataYMax ?? 1;
+  const violinHalfWidth = Math.max(0.18, Math.min(0.42, 2.2 / Math.max(bins.length, 1)));
+  const data: Data[] = bins.flatMap((bin, index) => {
+    const color = sequentialGradientColor(index, bins.length);
+    const center = index + 1;
+    const values = bin.points.map((point) => point.y);
+    const density = densityCurve(values, yFloor, yCeiling, violinHalfWidth);
+    const q1 = quantile(values, 0.25);
+    const median = quantile(values, 0.5);
+    const q3 = quantile(values, 0.75);
+    const left = density.x.map((_, pointIndex) => center - (density.y[pointIndex] ?? 0));
+    const right = density.x.map((_, pointIndex) => center + (density.y[pointIndex] ?? 0)).reverse();
+    const outlineX = [...left, ...right];
+    const outlineY = [...density.x, ...[...density.x].reverse()];
+    const jitteredX = bin.points.map((point, pointIndex) => {
+      const seed = `${point.sample.curve_id}:${pointIndex}:${bin.label}`;
+      let hash = 0;
+      for (const char of seed) hash = (hash * 33 + char.charCodeAt(0)) >>> 0;
+      return center + ((((hash % 1000) / 999) * 2 - 1) * violinHalfWidth * 0.82);
     });
-    return ids;
-  }, [activeNode, baseNetwork.edges]);
+    return [
+      {
+        type: "scatter",
+        mode: "lines",
+        x: outlineX,
+        y: outlineY,
+        line: { color, width: 1.6, shape: "spline", smoothing: 0.65 },
+        fill: "toself",
+        fillcolor: rgba(color, 0.22),
+        hoverinfo: "skip",
+        showlegend: false
+      } as Data,
+      {
+        type: "scatter",
+        mode: "lines",
+        x: [center, center],
+        y: [q1 ?? yFloor, q3 ?? yCeiling],
+        line: { color: rgba(color, 0.92), width: 4 },
+        hoverinfo: "skip",
+        showlegend: false
+      } as Data,
+      {
+        type: "scatter",
+        mode: "lines",
+        x: [center - violinHalfWidth * 0.48, center + violinHalfWidth * 0.48],
+        y: [median ?? yFloor, median ?? yFloor],
+        line: { color: rgba(color, 0.96), width: 2.4 },
+        hoverinfo: "skip",
+        showlegend: false
+      } as Data,
+      {
+        type: "scatter",
+        mode: "markers",
+        name: bin.label,
+        x: jitteredX,
+        y: values,
+        customdata: bin.points.map((point) => point.sample.curve_id),
+        marker: {
+          size: 5.5,
+          opacity: 0.66,
+          color,
+          line: { color: "#ffffff", width: 0.7 }
+        },
+        hovertemplate:
+          `%{customdata}<br>${metricLabel(xMetric)} bin ${bin.label}<br>${metricLabel(yMetric)} %{y:.3g}<extra></extra>`,
+        showlegend: false
+      } as Data
+    ];
+  });
 
-  const activeLinks = useMemo(() => {
-    if (activeNode === null) return [] as NetworkEdge[];
-    return baseNetwork.edges
-      .filter((edge) => edge.source === activeNode || edge.target === activeNode)
-      .sort((left, right) => Math.abs(right.r) - Math.abs(left.r))
-      .slice(0, 4);
-  }, [activeNode, baseNetwork.edges]);
+  const layout = {
+    autosize: true,
+    margin: { l: 58, r: 16, t: 8, b: 56 },
+    paper_bgcolor: "#ffffff",
+    plot_bgcolor: "#fbfdff",
+    font: { family: "Segoe UI, system-ui, sans-serif", color: "#263a55", size: 10 },
+    showlegend: false,
+    xaxis: {
+      title: { text: `${metricLabel(xMetric)} bins`, standoff: 10 },
+      tickangle: -22,
+      linecolor: "#9cabc0",
+      ticks: "outside",
+      tickmode: "array",
+      tickvals: bins.map((_, index) => index + 1),
+      ticktext: bins.map((bin) => bin.label),
+      range: bins.length > 0 ? [0.35, bins.length + 0.65] : undefined
+    },
+    yaxis: {
+      title: { text: metricLabel(yMetric), standoff: 8 },
+      gridcolor: "#eef2f7",
+      linecolor: "#9cabc0",
+      ticks: "outside",
+      range: resolvedRange(effectiveYMin, effectiveYMax)
+    },
+    uirevision: `violin-${xMetric}-${yMetric}-${binCount}`
+  } as Partial<Layout>;
+
+  function previewBin(ids: string[], label: string) {
+    if (ids.length === 0) return;
+    onPreview({
+      title: `${metricLabel(yMetric)} across ${metricLabel(xMetric)} bins`,
+      detail: `${label} - ${ids.length.toLocaleString()} curves`,
+      ids,
+      focusCurveId: null
+    });
+  }
+
+  function handleClick(event?: Readonly<PlotMouseEvent>) {
+    const traceName = event?.points?.[0]?.data?.name;
+    if (typeof traceName !== "string") return;
+    const bin = bins.find((candidate) => candidate.label === traceName);
+    if (!bin) return;
+    previewBin(
+      bin.points.map((point) => point.sample.curve_id),
+      formatRangeLabel(xMetric, bin.start, bin.end)
+    );
+  }
 
   return (
-    <section className="analysis-chart-panel analysis-network-panel">
+    <section className="analysis-chart-panel analysis-violin-panel">
       <div className="analysis-panel-header">
         <div>
-          <Target size={16} />
-          <h2>Correlation network</h2>
+          <ChartLine size={16} />
+          <h2>Binned violin</h2>
         </div>
-        <div className="analysis-control-row analysis-control-row-grid">
-          <label>
-            Threshold
-            <input
-              type="range"
-              min={0.2}
-              max={0.85}
-              step={0.05}
-              value={threshold}
-              onChange={(event) => setThreshold(Number(event.target.value))}
+        <div className="analysis-control-row analysis-control-row-violin">
+          <label>X
+            <select value={xMetric} onChange={(event) => setXMetric(event.target.value)}>
+              {metricOptions.map((option) => (
+                <option key={`violin-x-${option}`} value={option}>{metricLabel(option)}</option>
+              ))}
+            </select>
+          </label>
+          <label>Y
+            <select value={yMetric} onChange={(event) => setYMetric(event.target.value)}>
+              {metricOptions.map((option) => (
+                <option key={`violin-y-${option}`} value={option}>{metricLabel(option)}</option>
+              ))}
+            </select>
+          </label>
+          <label>X range
+            <div className="analysis-range-inline">
+              <CommitNumberInput value={xMin} fallback={dataXMin} onCommit={setXMin} />
+              <span>to</span>
+              <CommitNumberInput value={xMax} fallback={dataXMax} onCommit={setXMax} />
+            </div>
+          </label>
+          <label>Y range
+            <div className="analysis-range-inline">
+              <CommitNumberInput value={yMin} fallback={dataYMin} onCommit={setYMin} />
+              <span>to</span>
+              <CommitNumberInput value={yMax} fallback={dataYMax} onCommit={setYMax} />
+            </div>
+          </label>
+          <label>Bins
+            <CommitNumberInput
+              min={2}
+              max={24}
+              step={1}
+              value={binCount}
+              onCommit={(value) => setBinCount(clampInteger(value, 2, 24) ?? 2)}
             />
-            <strong>{fixed(threshold, 2)}</strong>
           </label>
         </div>
       </div>
-      <div className="analysis-network-shell">
-        <svg
-          ref={svgRef}
-          className="analysis-network-svg"
-          viewBox="0 0 1000 1000"
-          role="img"
-          aria-label="Draggable correlation network"
-        >
-          {baseNetwork.edges.map((edge) => {
-            const source = nodes.find((node) => node.id === edge.source);
-            const target = nodes.find((node) => node.id === edge.target);
-            if (!source || !target) return null;
-            const highlighted = activeNode !== null && (edge.source === activeNode || edge.target === activeNode);
-            return (
-              <line
-                key={`${edge.source}-${edge.target}`}
-                x1={source.x * 1000}
-                y1={source.y * 1000}
-                x2={target.x * 1000}
-                y2={target.y * 1000}
-                stroke={edge.r >= 0 ? "#cb2f69" : "#1d5fd1"}
-                strokeOpacity={activeNode === null ? 0.34 : highlighted ? 0.88 : 0.1}
-                strokeWidth={2 + Math.abs(edge.r) * 7}
-              />
-            );
-          })}
-          {nodes.map((node) => {
-            const active = activeNode === node.id;
-            const related = activeNode === null || connectedIds.has(node.id);
-            const radius = 24 + Math.min(node.degree, 6) * 4;
-            return (
-              <g
-                key={node.id}
-                className="analysis-network-node"
-                transform={`translate(${node.x * 1000} ${node.y * 1000})`}
-                onMouseEnter={() => setActiveNode(node.id)}
-                onMouseLeave={() => setActiveNode(null)}
-                onPointerDown={(event) => {
-                  dragRef.current = node.id;
-                  setActiveNode(node.id);
-                  event.currentTarget.setPointerCapture(event.pointerId);
-                }}
-              >
-                <circle
-                  r={radius}
-                  fill={active ? "#1459cb" : "#ffffff"}
-                  fillOpacity={related ? 0.98 : 0.42}
-                  stroke={active ? "#1459cb" : "#c7d4e3"}
-                  strokeWidth={active ? 4 : 2}
-                />
-                <text
-                  textAnchor="middle"
-                  dominantBaseline="central"
-                  fill={active ? "#ffffff" : "#263a55"}
-                  fontSize="24"
-                  fontWeight="700"
-                >
-                  {node.label}
-                </text>
-              </g>
-            );
-          })}
-        </svg>
-      </div>
+      <Plot
+        data={data}
+        layout={layout}
+        config={plotConfig(true)}
+        useResizeHandler
+        className="analysis-plot analysis-violin-plot"
+        onClick={handleClick}
+      />
       <div className="analysis-inline-stats">
-        <span>Nodes <strong>{nodes.length.toLocaleString()}</strong></span>
-        <span>Edges <strong>{baseNetwork.edges.length.toLocaleString()}</strong></span>
-        <span>Threshold <strong>{fixed(threshold, 2)}</strong></span>
-        <span>{activeNode ? `Focus ${metricLabel(activeNode)}` : "Drag a node to reshape the graph"}</span>
+        <span>Bins {bins.length.toLocaleString()}</span>
+        <span>Points {allPairs.length.toLocaleString()}</span>
+        <span>Visible curves {bins.reduce((sum, bin) => sum + bin.points.length, 0).toLocaleString()}</span>
+        <span>Click one violin to preview that bin in the curve plot.</span>
       </div>
-      {activeNode ? (
-        <div className="analysis-correlation-list">
-          {activeLinks.map((edge) => {
-            const other = edge.source === activeNode ? edge.target : edge.source;
-            return (
-              <span key={`${activeNode}-${other}`}>
-                {metricLabel(other)}
-                <strong>{fixed(edge.r, 3)}</strong>
-              </span>
-            );
-          })}
-        </div>
-      ) : null}
     </section>
   );
 }
@@ -1609,43 +1900,173 @@ function PcaExplorer({
     () => sampleEvenly(analysis.pca.points, ANALYSIS_PCA_CLUSTER_LIMIT),
     [analysis.pca.points]
   );
-  const [depth, setDepth] = useState(2);
-  const [clusterCount, setClusterCount] = useState<number | "auto">("auto");
+  const [clusterCountInput, setClusterCountInput] = useState<number | null>(null);
   const [colorMode, setColorMode] = useState<ColorMode>("cluster");
   const [xComponent, setXComponent] = useState(0);
   const [yComponent, setYComponent] = useState(1);
+  const [viewportResetKey, setViewportResetKey] = useState(0);
+  const lastClusterClickRef = useRef<{ label: string; at: number } | null>(null);
+  const lastContextMenuRef = useRef(0);
+  const hoverClearTimerRef = useRef<number | null>(null);
+  const pcaGraphRef = useRef<PlotlyHTMLElement | null>(null);
+  const styledClusterRef = useRef<string | null | undefined>(undefined);
 
   useEffect(() => {
-    setDepth((current) => Math.min(Math.max(1, current), Math.max(1, componentCount)));
     setXComponent((current) => Math.min(current, Math.max(0, componentCount - 1)));
     setYComponent((current) => Math.min(Math.max(1, current), Math.max(0, componentCount - 1)));
   }, [componentCount]);
 
+  const clusteringDepth = Math.min(
+    componentCount,
+    Math.max(2, Math.min(componentCount, Math.max(xComponent, yComponent) + 2))
+  );
   const clusterOptions = useMemo(
-    () => [2, 3, 4, 5, 6, 8].filter((value) => value <= Math.max(2, plottedPcaPoints.length)),
+    () => [2, 3, 4, 5, 6, 8, 10].filter((value) => value <= Math.max(2, plottedPcaPoints.length)),
     [plottedPcaPoints.length]
   );
-  const effectiveDepth = Math.min(depth, componentCount);
   const autoClusterCount = useMemo(
-    () => chooseAutoClusterCount(plottedPcaPoints, effectiveDepth, clusterOptions),
-    [plottedPcaPoints, clusterOptions, effectiveDepth]
+    () => chooseAutoClusterCount(plottedPcaPoints, clusteringDepth, clusterOptions),
+    [clusteringDepth, plottedPcaPoints, clusterOptions]
   );
-  const effectiveClusterCount = clusterCount === "auto" ? autoClusterCount : clusterCount;
+  const effectiveClusterCount =
+    clusterCountInput !== null && clusterCountInput >= 2
+      ? Math.min(clusterCountInput, Math.max(2, plottedPcaPoints.length))
+      : autoClusterCount;
   const clusterResult = useMemo(
-    () => clusterPca(plottedPcaPoints, effectiveDepth, effectiveClusterCount),
-    [plottedPcaPoints, effectiveClusterCount, effectiveDepth]
+    () => clusterPca(plottedPcaPoints, clusteringDepth, effectiveClusterCount),
+    [clusteringDepth, effectiveClusterCount, plottedPcaPoints]
   );
+  const clusterLabelById = useMemo(() => {
+    const labels = new Map<string, string>();
+    plottedPcaPoints.forEach((point) => {
+      const clusterIndex = clusterResult.assignments.get(point.curve_id) ?? 0;
+      labels.set(point.curve_id, `Cluster ${clusterIndex + 1}`);
+    });
+    return labels;
+  }, [clusterResult.assignments, plottedPcaPoints]);
+  const clusterGroups = useMemo(() => {
+    const buckets = new Map<string, AnalysisPcaPoint[]>();
+    plottedPcaPoints.forEach((point) => {
+      if (point.scores.length <= Math.max(xComponent, yComponent)) return;
+      const label = clusterLabelById.get(point.curve_id) ?? "Cluster 1";
+      buckets.set(label, [...(buckets.get(label) ?? []), point]);
+    });
+    return [...buckets.entries()].sort(([a], [b]) => a.localeCompare(b));
+  }, [clusterLabelById, plottedPcaPoints, xComponent, yComponent]);
   const grouped = useMemo(() => {
     const buckets = new Map<string, AnalysisPcaPoint[]>();
     plottedPcaPoints.forEach((point) => {
       if (point.scores.length <= Math.max(xComponent, yComponent)) return;
-      const label = colorMode === "cluster"
-        ? `Cluster ${(clusterResult.assignments.get(point.curve_id) ?? 0) + 1}`
-        : String(point[colorMode]);
+      const label =
+        colorMode === "cluster"
+          ? clusterLabelById.get(point.curve_id) ?? "Cluster 1"
+          : String(point[colorMode]);
       buckets.set(label, [...(buckets.get(label) ?? []), point]);
     });
     return [...buckets.entries()].sort(([a], [b]) => a.localeCompare(b));
-  }, [plottedPcaPoints, clusterResult.assignments, colorMode, xComponent, yComponent]);
+  }, [clusterLabelById, colorMode, plottedPcaPoints, xComponent, yComponent]);
+  const projectedPoints = useMemo(
+    () =>
+      plottedPcaPoints
+        .filter((point) => point.scores.length > Math.max(xComponent, yComponent))
+        .map((point) => ({
+          x: point.scores[xComponent] ?? 0,
+          y: point.scores[yComponent] ?? 0
+        })),
+    [plottedPcaPoints, xComponent, yComponent]
+  );
+  const { min: xMin, max: xMax } = useMemo(
+    () => numericBounds(projectedPoints.map((point) => point.x)),
+    [projectedPoints]
+  );
+  const { min: yMin, max: yMax } = useMemo(
+    () => numericBounds(projectedPoints.map((point) => point.y)),
+    [projectedPoints]
+  );
+  const baseXRange = useMemo(() => expandedRange(xMin, xMax, 0.08), [xMax, xMin]);
+  const baseYRange = useMemo(() => expandedRange(yMin, yMax, 0.08), [yMax, yMin]);
+  const hullTraceDefs = useMemo(() => {
+    const spanX = (xMax ?? 1) - (xMin ?? 0);
+    const spanY = (yMax ?? 1) - (yMin ?? 0);
+    return clusterGroups.flatMap(([label, points]) => {
+      const polygon = clusterEnvelope(
+        points.map((point) => ({
+          x: point.scores[xComponent] ?? 0,
+          y: point.scores[yComponent] ?? 0
+        })),
+        spanX,
+        spanY
+      );
+      if (polygon.length < 3) return [];
+      return [{
+        label,
+        trace: {
+          type: "scatter",
+          mode: "lines",
+          x: [...polygon.map((point) => point.x), polygon[0]!.x],
+          y: [...polygon.map((point) => point.y), polygon[0]!.y],
+          customdata: [...polygon.map(() => ["__cluster__", label] as PcaHullCustomData), ["__cluster__", label] as PcaHullCustomData],
+          name: label,
+          hoveron: "fills",
+          line: {
+            color: rgba(colorFor(label), 0.38),
+            width: 1.2,
+            shape: "spline",
+            smoothing: 0.55
+          },
+          fill: "toself",
+          fillcolor: rgba(colorFor(label), 0.08),
+          opacity: 1,
+          hovertemplate: `${label}<br>%{x:.3g}, %{y:.3g}<extra>Cluster region</extra>`,
+          showlegend: false
+        } as Data
+      }];
+    });
+  }, [clusterGroups, xComponent, xMax, xMin, yComponent, yMax, yMin]);
+
+  useEffect(() => {
+    if (hoverClearTimerRef.current !== null) {
+      window.clearTimeout(hoverClearTimerRef.current);
+      hoverClearTimerRef.current = null;
+    }
+    lastClusterClickRef.current = null;
+  }, [colorMode, effectiveClusterCount, xComponent, yComponent, viewportResetKey]);
+  useEffect(() => () => {
+    if (hoverClearTimerRef.current !== null) window.clearTimeout(hoverClearTimerRef.current);
+  }, []);
+
+  const markerTraceDefs = useMemo(() => {
+    if (componentCount < 2) {
+      return [] as Array<{
+        label: string;
+        pointClusterLabels: string[];
+        trace: Data;
+      }>;
+    }
+    return grouped.map(([label, points]) => ({
+      label,
+      pointClusterLabels: points.map((point) => clusterLabelById.get(point.curve_id) ?? "Cluster 1"),
+      trace: {
+        type: "scatter",
+        mode: "markers",
+        x: points.map((point) => point.scores[xComponent]),
+        y: points.map((point) => point.scores[yComponent]),
+        customdata: points.map((point) => [
+          point.curve_id,
+          label,
+          clusterLabelById.get(point.curve_id) ?? "Cluster 1"
+        ] as PcaMarkerCustomData),
+        name: label,
+        marker: {
+          color: colorFor(label),
+          size: 7.4,
+          opacity: 0.78,
+          line: { color: "rgba(255,255,255,0.72)", width: 0.55 }
+        },
+        hovertemplate: `%{customdata[0]}<br>${analysis.pca.components[xComponent].name} %{x:.3g}<br>${analysis.pca.components[yComponent].name} %{y:.3g}<extra>%{customdata[2]}</extra>`
+      } as Data
+    }));
+  }, [analysis.pca.components, clusterLabelById, componentCount, grouped, xComponent, yComponent]);
 
   if (componentCount < 2) {
     return (
@@ -1661,30 +2082,31 @@ function PcaExplorer({
     );
   }
 
-  const data: Data[] = grouped.map(([label, points]) => ({
-    type: "scatter",
-    mode: "markers",
-    x: points.map((point) => point.scores[xComponent]),
-    y: points.map((point) => point.scores[yComponent]),
-    customdata: points.map((point) => point.curve_id),
-    name: label,
-    marker: {
-      color: colorFor(label),
-      size: 7,
-      opacity: 0.72,
-      line: { color: "#ffffff", width: 0.5 }
-    },
-    hovertemplate: `%{customdata}<br>${analysis.pca.components[xComponent].name} %{x:.3g}<br>${analysis.pca.components[yComponent].name} %{y:.3g}<extra>${label}</extra>`
-  } as Data));
+  const data: Data[] = [
+    ...hullTraceDefs.map((entry) => entry.trace),
+    ...markerTraceDefs.map((entry) => entry.trace)
+  ];
   const layout: Partial<Layout> = {
     autosize: true,
-    margin: { l: 58, r: 22, t: 8, b: 50 },
+    margin: { l: 58, r: 20, t: 8, b: 52 },
     paper_bgcolor: "#ffffff",
     plot_bgcolor: "#fbfdff",
     font: { family: "Segoe UI, system-ui, sans-serif", color: "#263a55", size: 10 },
     showlegend: true,
-    legend: { orientation: "h", x: 0, y: 1.12, font: { size: 9 } },
-    dragmode: "select",
+    legend: {
+      orientation: "v",
+      x: 0.995,
+      xanchor: "right",
+      y: 0.995,
+      yanchor: "top",
+      font: { size: 9 },
+      bgcolor: "rgba(255,255,255,0.86)",
+      bordercolor: "#d8e3ef",
+      borderwidth: 1,
+      itemsizing: "constant"
+    },
+    dragmode: "pan",
+    hovermode: "closest",
     xaxis: {
       title: {
         text: `${analysis.pca.components[xComponent].name} (${fixed(100 * analysis.pca.components[xComponent].explained_variance_ratio, 1)}%)`,
@@ -1693,7 +2115,8 @@ function PcaExplorer({
       gridcolor: "#eef2f7",
       zerolinecolor: "#cdd7e5",
       linecolor: "#9cabc0",
-      ticks: "outside"
+      ticks: "outside",
+      range: baseXRange
     },
     yaxis: {
       title: {
@@ -1703,42 +2126,104 @@ function PcaExplorer({
       gridcolor: "#eef2f7",
       zerolinecolor: "#cdd7e5",
       linecolor: "#9cabc0",
-      ticks: "outside"
+      ticks: "outside",
+      range: baseYRange
     },
-    uirevision: `pca-${depth}-${effectiveClusterCount}-${colorMode}-${xComponent}-${yComponent}`
+    uirevision: `pca-${clusteringDepth}-${effectiveClusterCount}-${colorMode}-${xComponent}-${yComponent}-${viewportResetKey}`
   };
 
-  function previewIds(ids: string[], title: string) {
-    onPreview({ title, detail: `${ids.length.toLocaleString()} curves`, ids });
+  function applyPcaHoverStyle(clusterLabel: string | null) {
+    const graph = pcaGraphRef.current;
+    if (!graph) return;
+    if (styledClusterRef.current === clusterLabel) return;
+    styledClusterRef.current = clusterLabel;
+    const hullCount = hullTraceDefs.length;
+    hullTraceDefs.forEach((entry, traceIndex) => {
+      const active = clusterLabel !== null && entry.label === clusterLabel;
+      void PlotlyApi.restyle(graph, {
+        "line.color": rgba(colorFor(entry.label), active ? 0.7 : 0.38),
+        "line.width": active ? 2.2 : 1.2,
+        fillcolor: rgba(
+          colorFor(entry.label),
+          active ? 0.14 : clusterLabel === null ? 0.08 : 0.035
+        )
+      } as unknown as Data, traceIndex);
+    });
+    markerTraceDefs.forEach((entry, markerIndex) => {
+      const traceIndex = hullCount + markerIndex;
+      void PlotlyApi.restyle(graph, {
+        "marker.opacity": [
+          entry.pointClusterLabels.map((pointClusterLabel) =>
+            clusterLabel === null ? 0.78 : pointClusterLabel === clusterLabel ? 0.94 : 0.11
+          )
+        ]
+      } as unknown as Data, traceIndex);
+    });
   }
 
-  function handleSelected(event?: Readonly<PlotSelectionEvent>) {
-    const ids = (event?.points ?? [])
-      .map((point) => (point as { customdata?: unknown }).customdata)
-      .filter((value): value is string => typeof value === "string");
-    if (ids.length === 0) return;
-    previewIds(ids, "PCA selection");
+  useEffect(() => {
+    styledClusterRef.current = undefined;
+    applyPcaHoverStyle(null);
+  }, [hullTraceDefs, markerTraceDefs, viewportResetKey]);
+
+  function previewIds(ids: string[], title: string, focusCurveId: string | null = null) {
+    onPreview({ title, detail: `${ids.length.toLocaleString()} curves`, ids, focusCurveId });
+  }
+
+  function idsForCluster(label: string) {
+    const clusterIndex = Number.parseInt(label.replace("Cluster ", ""), 10) - 1;
+    if (!Number.isFinite(clusterIndex) || clusterIndex < 0) return [];
+    return clusterResult.idsByCluster.get(clusterIndex) ?? [];
+  }
+
+  function parsePcaEvent(event?: Readonly<PlotMouseEvent>) {
+    const customdata = (event?.points?.[0] as { customdata?: unknown } | undefined)?.customdata;
+    if (Array.isArray(customdata) && customdata[0] === "__cluster__" && typeof customdata[1] === "string") {
+      return { clusterLabel: customdata[1], curveId: null as string | null };
+    }
+    if (Array.isArray(customdata) && typeof customdata[0] === "string") {
+      const clusterLabel =
+        typeof customdata[2] === "string"
+          ? customdata[2]
+          : typeof customdata[1] === "string"
+            ? customdata[1]
+            : null;
+      return { clusterLabel, curveId: customdata[0] };
+    }
+    return { clusterLabel: null, curveId: null as string | null };
   }
 
   function handleClick(event?: Readonly<PlotMouseEvent>) {
-    const id = (event?.points?.[0] as { customdata?: unknown } | undefined)?.customdata;
-    if (typeof id !== "string") return;
-    if (colorMode === "cluster") {
-      const clusterIndex = clusterResult.assignments.get(id);
-      const ids = clusterIndex === undefined ? [id] : (clusterResult.idsByCluster.get(clusterIndex) ?? [id]);
-      previewIds(ids, `Cluster ${clusterIndex === undefined ? "?" : clusterIndex + 1}`);
+    const { clusterLabel, curveId } = parsePcaEvent(event);
+    if (clusterLabel === null && curveId === null) return;
+    if (event?.event?.ctrlKey || event?.event?.metaKey) {
+      if (curveId === null) return;
+      const clusterIds = clusterLabel ? idsForCluster(clusterLabel) : [];
+      previewIds(clusterIds.length > 0 ? clusterIds : [curveId], clusterLabel ?? curveId, curveId);
       return;
     }
-    previewIds([id], id);
+    if (clusterLabel === null) return;
+    const now = Date.now();
+    const lastClick = lastClusterClickRef.current;
+    if (lastClick && lastClick.label === clusterLabel && now - lastClick.at < 360) {
+      const ids = idsForCluster(clusterLabel);
+      if (ids.length > 0) previewIds(ids, clusterLabel);
+      lastClusterClickRef.current = null;
+      return;
+    }
+    lastClusterClickRef.current = { label: clusterLabel, at: now };
   }
 
-  const clusterSizes = clusterResult.clusterSizes;
-  const xLoadings = Object.entries(analysis.pca.components[xComponent].loadings)
-    .sort(([, a], [, b]) => Math.abs(b) - Math.abs(a))
-    .slice(0, 5);
-  const yLoadings = Object.entries(analysis.pca.components[yComponent].loadings)
-    .sort(([, a], [, b]) => Math.abs(b) - Math.abs(a))
-    .slice(0, 5);
+  function handleRightDoubleClick(event: ReactMouseEvent<HTMLDivElement>) {
+    event.preventDefault();
+    const now = Date.now();
+    if (now - lastContextMenuRef.current < 360) {
+      setViewportResetKey((current) => current + 1);
+      lastContextMenuRef.current = 0;
+      return;
+    }
+    lastContextMenuRef.current = now;
+  }
 
   return (
     <section className="analysis-chart-panel analysis-pca-panel">
@@ -1748,93 +2233,48 @@ function PcaExplorer({
           <h2>PCA workspace</h2>
         </div>
       </div>
-      <div className="analysis-pca-stage">
+      <div className="analysis-pca-stage" onContextMenu={handleRightDoubleClick}>
         <Plot
           data={data}
           layout={layout}
-          config={plotConfig(true)}
+          config={plotConfig(true, { scrollZoom: true, doubleClick: false })}
           useResizeHandler
           className="analysis-plot analysis-pca-plot"
-          onSelected={handleSelected}
+          onInitialized={(_, graphDiv) => {
+            pcaGraphRef.current = graphDiv as PlotlyHTMLElement;
+            styledClusterRef.current = undefined;
+          }}
           onClick={handleClick}
+          onHover={(event) => {
+            if (hoverClearTimerRef.current !== null) {
+              window.clearTimeout(hoverClearTimerRef.current);
+              hoverClearTimerRef.current = null;
+            }
+            const { clusterLabel } = parsePcaEvent(event);
+            applyPcaHoverStyle(clusterLabel);
+          }}
+          onUnhover={() => {
+            if (hoverClearTimerRef.current !== null) window.clearTimeout(hoverClearTimerRef.current);
+            hoverClearTimerRef.current = window.setTimeout(() => {
+              applyPcaHoverStyle(null);
+              hoverClearTimerRef.current = null;
+            }, 90);
+          }}
         />
       </div>
-      <div className="analysis-pca-summary-grid">
-        <section className="analysis-pca-side-card analysis-pca-compact-card">
-          <h3>Explained variance</h3>
-          <div className="analysis-pca-bars">
-            {analysis.pca.components.map((component) => (
-              <div key={component.name}>
-                <span>{component.name}</span>
-                <b><i style={{ width: `${Math.max(2, component.explained_variance_ratio * 100)}%` }} /></b>
-                <strong>{fixed(component.explained_variance_ratio * 100, 1)}%</strong>
-              </div>
-            ))}
-          </div>
-        </section>
-        <section className="analysis-pca-side-card analysis-pca-compact-card">
-          <h3>Dominant loadings</h3>
-          <div className="analysis-pca-loading-columns">
-            <div className="analysis-loading-list">
-              <span><strong>{analysis.pca.components[xComponent].name}</strong></span>
-              {xLoadings.map(([feature, value]) => (
-                <span key={`x-${feature}`}>{metricLabel(feature)} <strong>{fixed(value, 2)}</strong></span>
-              ))}
-            </div>
-            <div className="analysis-loading-list">
-              <span><strong>{analysis.pca.components[yComponent].name}</strong></span>
-              {yLoadings.map(([feature, value]) => (
-                <span key={`y-${feature}`}>{metricLabel(feature)} <strong>{fixed(value, 2)}</strong></span>
-              ))}
-            </div>
-          </div>
-        </section>
-        <section className="analysis-pca-side-card analysis-pca-compact-card">
-          <h3>Cluster size</h3>
-          <div className="analysis-cluster-list">
-            {Object.entries(clusterSizes).map(([cluster, count]) => (
-              <button
-                key={cluster}
-                type="button"
-                className="analysis-cluster-chip"
-                onClick={() => {
-                  const clusterIndex = Number(cluster.replace("C", "")) - 1;
-                  const ids = clusterResult.idsByCluster.get(clusterIndex) ?? [];
-                  if (ids.length > 0) previewIds(ids, `Cluster ${clusterIndex + 1}`);
-                }}
-              >
-                <span>{cluster}</span>
-                <strong>{count.toLocaleString()}</strong>
-              </button>
-            ))}
-          </div>
-        </section>
-      </div>
-      <div className="analysis-control-row analysis-control-row-grid analysis-control-row-bottom">
-        <label>
-          Depth
-          <input
-            type="range"
-            min={1}
-            max={componentCount}
-            value={depth}
-            onChange={(event) => setDepth(Number(event.target.value))}
-          />
-          <strong>{depth}</strong>
-        </label>
+      <div className="analysis-control-row analysis-control-row-grid analysis-control-row-bottom analysis-control-row-pca">
         <label>
           Clusters
-          <select
-            value={String(clusterCount)}
-            onChange={(event) =>
-              setClusterCount(event.target.value === "auto" ? "auto" : Number(event.target.value))
+          <CommitNumberInput
+            min={2}
+            max={Math.max(2, plottedPcaPoints.length)}
+            step={1}
+            value={clusterCountInput}
+            placeholder={`Auto (${autoClusterCount})`}
+            onCommit={(value) =>
+              setClusterCountInput(clampInteger(value, 2, Math.max(2, plottedPcaPoints.length)))
             }
-          >
-            <option value="auto">Auto ({effectiveClusterCount})</option>
-            {clusterOptions.map((value) => (
-              <option key={value} value={value}>{value}</option>
-            ))}
-          </select>
+          />
         </label>
         <label>
           Color
@@ -1960,7 +2400,8 @@ export function AnalysisWorkspace({ selection }: { selection: DatabaseSelectionS
       setPreviewRequest({
         title: "Curve data preview",
         detail: `${Math.min(response.samples.length, PREVIEW_CURVE_LIMIT)} filtered curves`,
-        ids: response.samples.slice(0, PREVIEW_CURVE_LIMIT).map((sample) => sample.curve_id)
+        ids: response.samples.slice(0, PREVIEW_CURVE_LIMIT).map((sample) => sample.curve_id),
+        focusCurveId: null
       });
       setHistogramMetric((current) =>
         response.metrics[current] ? current : Object.keys(response.metrics)[0] ?? "logRatio"
@@ -2071,7 +2512,7 @@ export function AnalysisWorkspace({ selection }: { selection: DatabaseSelectionS
             <span>
               Based on current Database selection
               {analysis.sample_count < analysis.count
-                ? ` · charts use ${analysis.sample_count.toLocaleString()} sampled curves`
+                ? ` - charts use ${analysis.sample_count.toLocaleString()} sampled curves`
                 : ""}
             </span>
           ) : null}
@@ -2120,10 +2561,11 @@ export function AnalysisWorkspace({ selection }: { selection: DatabaseSelectionS
             />
             <CorrelationPanel analysis={analysis} />
             <PcaExplorer analysis={analysis} onPreview={setPreviewRequest} />
-            <CorrelationNetworkPanel analysis={analysis} />
+            <BinnedViolinPanel analysis={analysis} onPreview={setPreviewRequest} />
           </div>
         </div>
       ) : null}
     </main>
   );
 }
+

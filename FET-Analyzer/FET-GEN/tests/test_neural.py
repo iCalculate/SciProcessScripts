@@ -9,6 +9,7 @@ from devicecurvegen.physics import generate_curves
 from devicecurvegen.residual import ResidualEngine
 from devicecurvegen.schemas import GenerationCondition, NeuralTrainingRequest
 from devicecurvegen.training_service import NeuralTrainingManager
+from tools.build_hybrid_checkpoint import build_hybrid_checkpoint
 
 
 def _write_neural_dataset(
@@ -101,7 +102,56 @@ def test_train_load_and_sample_conditional_vae(tmp_path: Path) -> None:
     assert np.isfinite(result.validation_loss)
     assert engine.mode == "conditional_vae"
     assert engine.info().components == 3
+    assert "log10_gm_max" in engine.info().condition_features
     assert len(generated.candidates[0].latent_code) == 3
+    assert np.all(np.isfinite(generated.candidates[0].forward_current))
+
+
+def test_aligned_local_delta_cvae_trains_loads_and_samples(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    checkpoint = tmp_path / "aligned-local-delta-cvae.npz"
+    _write_neural_dataset(dataset, include_gate=True)
+    result = train_neural_checkpoint(
+        checkpoint,
+        dataset_path=dataset,
+        config=NeuralTrainingConfig(
+            method="aligned_local_delta_cvae",
+            latent_dim=4,
+            hidden_dim=16,
+            epochs=3,
+            batch_size=4,
+            patience=3,
+            slope_weight=0.25,
+            subthreshold_weight=3.0,
+            seed=8,
+        ),
+    )
+
+    engine = ResidualEngine(checkpoint)
+    generated = generate_curves(
+        GenerationCondition(
+            variants=1,
+            voltage_min=-5.0,
+            voltage_max=10.0,
+            target_vth=2.2,
+            target_ss_mv_dec=135.0,
+            points=101,
+            gate_ai_residual_strength=1.0,
+        ),
+        engine,
+    )
+
+    assert result.method == "aligned_local_delta_cvae"
+    assert result.best_epoch >= 1
+    assert np.isfinite(result.validation_loss)
+    assert engine.mode == "conditional_vae"
+    assert engine.info().architecture == "aligned_local_delta_conditional_vae_residual_skip"
+    assert engine.metadata["threshold_local_align_window_scale"] > 0
+    assert engine.metadata["threshold_local_align_min_window_v"] > 0
+    assert len(engine.metadata["latent_prior_std"]) == 4
+    assert engine.threshold_local_delta_transform is True
+    assert len(generated.candidates[0].latent_code) == 4
+    assert generated.candidates[0].gate_latent_code
     assert np.all(np.isfinite(generated.candidates[0].forward_current))
 
 
@@ -171,6 +221,453 @@ def test_latent_pca_trains_from_aligned_dual_channel_dataset(tmp_path: Path) -> 
     assert result.generated_channels == ["Ids", "Ig"]
     assert engine.mode == "learned_pca"
     assert generated.candidates[0].gate_latent_code
+
+
+def test_conditional_pca_trains_and_samples_from_conditions(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    checkpoint = tmp_path / "conditional-pca.npz"
+    _write_neural_dataset(dataset, include_gate=True)
+    result = train_neural_checkpoint(
+        checkpoint,
+        dataset_path=dataset,
+        config=NeuralTrainingConfig(
+            method="conditional_pca",
+            pca_components=5,
+            beta=0.01,
+            seed=17,
+        ),
+    )
+
+    engine = ResidualEngine(checkpoint)
+    generated = generate_curves(
+        GenerationCondition(
+            variants=1,
+            points=101,
+            gate_ai_residual_strength=1.0,
+            target_vth=2.3,
+            target_ss_mv_dec=140.0,
+        ),
+        engine,
+    )
+    candidate = generated.candidates[0]
+
+    assert result.method == "conditional_pca"
+    assert result.latent_dim == 5
+    assert engine.mode == "learned_pca"
+    assert engine.info().architecture == "conditional_pca"
+    assert "log10_gm_max" in engine.info().condition_features
+    assert len(candidate.latent_code) == 5
+    assert candidate.gate_latent_code
+    assert np.all(np.isfinite(candidate.forward_current))
+
+
+def test_threshold_conditional_pca_trains_and_samples_from_conditions(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    checkpoint = tmp_path / "threshold-conditional-pca.npz"
+    _write_neural_dataset(dataset, include_gate=True)
+    result = train_neural_checkpoint(
+        checkpoint,
+        dataset_path=dataset,
+        config=NeuralTrainingConfig(
+            method="threshold_conditional_pca",
+            pca_components=5,
+            beta=0.01,
+            subthreshold_weight=3.2,
+            slope_weight=0.35,
+            seed=29,
+        ),
+    )
+
+    engine = ResidualEngine(checkpoint)
+    generated = generate_curves(
+        GenerationCondition(
+            variants=1,
+            points=101,
+            gate_ai_residual_strength=1.0,
+            target_vth=2.1,
+            target_ss_mv_dec=135.0,
+        ),
+        engine,
+    )
+    candidate = generated.candidates[0]
+
+    assert result.method == "threshold_conditional_pca"
+    assert result.latent_dim == 5
+    assert engine.mode == "learned_pca"
+    assert engine.info().architecture == "threshold_conditional_pca"
+    assert len(candidate.latent_code) == 5
+    assert candidate.gate_latent_code
+    assert np.all(np.isfinite(candidate.forward_current))
+
+
+def test_local_threshold_conditional_pca_trains_and_samples_from_conditions(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset"
+    checkpoint = tmp_path / "local-threshold-conditional-pca.npz"
+    _write_neural_dataset(dataset, include_gate=True)
+    result = train_neural_checkpoint(
+        checkpoint,
+        dataset_path=dataset,
+        config=NeuralTrainingConfig(
+            method="local_threshold_conditional_pca",
+            pca_components=5,
+            beta=0.012,
+            subthreshold_weight=3.2,
+            slope_weight=0.35,
+            seed=43,
+        ),
+    )
+
+    engine = ResidualEngine(checkpoint)
+    generated = generate_curves(
+        GenerationCondition(
+            variants=1,
+            points=101,
+            gate_ai_residual_strength=1.0,
+            target_vth=2.1,
+            target_ss_mv_dec=135.0,
+        ),
+        engine,
+    )
+    candidate = generated.candidates[0]
+
+    assert result.method == "local_threshold_conditional_pca"
+    assert result.latent_dim == 5
+    assert engine.mode == "learned_pca"
+    assert engine.info().architecture == "local_threshold_conditional_pca"
+    assert len(candidate.latent_code) == 5
+    assert candidate.gate_latent_code
+    assert np.all(np.isfinite(candidate.forward_current))
+
+
+def test_aligned_local_threshold_conditional_pca_trains_and_samples_from_conditions(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset"
+    checkpoint = tmp_path / "aligned-local-threshold-conditional-pca.npz"
+    _write_neural_dataset(dataset, include_gate=True)
+    result = train_neural_checkpoint(
+        checkpoint,
+        dataset_path=dataset,
+        config=NeuralTrainingConfig(
+            method="aligned_local_threshold_conditional_pca",
+            pca_components=5,
+            beta=0.012,
+            subthreshold_weight=3.2,
+            slope_weight=0.35,
+            seed=44,
+        ),
+    )
+
+    engine = ResidualEngine(checkpoint)
+    generated = generate_curves(
+        GenerationCondition(
+            variants=1,
+            points=101,
+            gate_ai_residual_strength=1.0,
+            target_vth=2.1,
+            target_ss_mv_dec=135.0,
+        ),
+        engine,
+    )
+    candidate = generated.candidates[0]
+
+    assert result.method == "aligned_local_threshold_conditional_pca"
+    assert result.latent_dim == 5
+    assert engine.mode == "learned_pca"
+    assert engine.info().architecture == "aligned_local_threshold_conditional_pca"
+    assert engine.metadata["threshold_local_align_window_scale"] > 0
+    assert engine.metadata["threshold_local_align_min_window_v"] > 0
+    assert len(candidate.latent_code) == 5
+    assert candidate.gate_latent_code
+    assert np.all(np.isfinite(candidate.forward_current))
+
+
+def test_aligned_local_delta_conditional_pca_trains_and_samples_from_conditions(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset"
+    checkpoint = tmp_path / "aligned-local-delta-conditional-pca.npz"
+    _write_neural_dataset(dataset, include_gate=True)
+    result = train_neural_checkpoint(
+        checkpoint,
+        dataset_path=dataset,
+        config=NeuralTrainingConfig(
+            method="aligned_local_delta_conditional_pca",
+            pca_components=5,
+            beta=0.012,
+            subthreshold_weight=3.2,
+            slope_weight=0.40,
+            seed=54,
+        ),
+    )
+
+    engine = ResidualEngine(checkpoint)
+    generated = generate_curves(
+        GenerationCondition(
+            variants=1,
+            points=101,
+            gate_ai_residual_strength=1.0,
+            target_vth=2.1,
+            target_ss_mv_dec=135.0,
+        ),
+        engine,
+    )
+    candidate = generated.candidates[0]
+
+    assert result.method == "aligned_local_delta_conditional_pca"
+    assert result.latent_dim == 5
+    assert engine.mode == "learned_pca"
+    assert engine.info().architecture == "aligned_local_delta_conditional_pca"
+    assert engine.metadata["threshold_local_align_window_scale"] > 0
+    assert engine.metadata["threshold_local_align_min_window_v"] > 0
+    assert engine.threshold_local_delta_transform is True
+    assert len(candidate.latent_code) == 5
+    assert candidate.gate_latent_code
+    assert np.all(np.isfinite(candidate.forward_current))
+
+
+def test_aligned_local_affine_delta_conditional_pca_trains_and_samples_from_conditions(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset"
+    checkpoint = tmp_path / "aligned-local-affine-delta-conditional-pca.npz"
+    _write_neural_dataset(dataset, include_gate=True)
+    result = train_neural_checkpoint(
+        checkpoint,
+        dataset_path=dataset,
+        config=NeuralTrainingConfig(
+            method="aligned_local_affine_delta_conditional_pca",
+            pca_components=5,
+            beta=0.012,
+            subthreshold_weight=3.2,
+            slope_weight=0.40,
+            seed=64,
+        ),
+    )
+
+    engine = ResidualEngine(checkpoint)
+    generated = generate_curves(
+        GenerationCondition(
+            variants=1,
+            points=101,
+            gate_ai_residual_strength=1.0,
+            target_vth=2.1,
+            target_ss_mv_dec=135.0,
+        ),
+        engine,
+    )
+    candidate = generated.candidates[0]
+
+    assert result.method == "aligned_local_affine_delta_conditional_pca"
+    assert result.latent_dim == 5
+    assert engine.mode == "learned_pca"
+    assert engine.info().architecture == "aligned_local_affine_delta_conditional_pca"
+    assert engine.metadata["threshold_local_align_window_scale"] > 0
+    assert engine.metadata["threshold_local_align_min_window_v"] > 0
+    assert engine.metadata["threshold_local_affine_restore"] is True
+    assert engine.threshold_local_delta_transform is True
+    assert engine.affine_w is not None
+    assert engine.affine_b is not None
+    assert len(candidate.latent_code) == 5
+    assert candidate.gate_latent_code
+    assert np.all(np.isfinite(candidate.forward_current))
+
+
+def test_hybrid_threshold_pca_builds_and_samples(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    base_checkpoint = tmp_path / "base-pca.npz"
+    guide_checkpoint = tmp_path / "guide-conditional-pca.npz"
+    hybrid_checkpoint = tmp_path / "hybrid-threshold-pca.npz"
+    _write_neural_dataset(dataset, include_gate=True)
+    train_neural_checkpoint(
+        base_checkpoint,
+        dataset_path=dataset,
+        config=NeuralTrainingConfig(
+            method="latent_pca",
+            pca_components=4,
+            seed=19,
+        ),
+    )
+    train_neural_checkpoint(
+        guide_checkpoint,
+        dataset_path=dataset,
+        config=NeuralTrainingConfig(
+            method="conditional_pca",
+            pca_components=4,
+            beta=0.01,
+            seed=23,
+        ),
+    )
+    build_hybrid_checkpoint(
+        base_path=base_checkpoint,
+        guide_path=guide_checkpoint,
+        output_path=hybrid_checkpoint,
+        local_blend=0.82,
+        global_blend=0.06,
+        window_scale=3.0,
+        min_window_v=0.22,
+    )
+
+    engine = ResidualEngine(hybrid_checkpoint)
+    generated = generate_curves(
+        GenerationCondition(
+            variants=1,
+            points=101,
+            gate_ai_residual_strength=1.0,
+            target_vth=2.3,
+            target_ss_mv_dec=140.0,
+        ),
+        engine,
+    )
+    candidate = generated.candidates[0]
+
+    assert engine.info().architecture == "hybrid_threshold_pca"
+    assert engine.info().components == 8
+    assert candidate.gate_latent_code
+    assert np.all(np.isfinite(candidate.forward_current))
+
+
+def test_hybrid_threshold_pca_supports_separate_reverse_guide(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    base_checkpoint = tmp_path / "base-pca.npz"
+    guide_checkpoint = tmp_path / "guide-conditional-pca.npz"
+    reverse_guide_checkpoint = tmp_path / "reverse-guide-threshold-pca.npz"
+    hybrid_checkpoint = tmp_path / "hybrid-threshold-directional-pca.npz"
+    _write_neural_dataset(dataset, include_gate=True)
+    train_neural_checkpoint(
+        base_checkpoint,
+        dataset_path=dataset,
+        config=NeuralTrainingConfig(
+            method="latent_pca",
+            pca_components=4,
+            seed=31,
+        ),
+    )
+    train_neural_checkpoint(
+        guide_checkpoint,
+        dataset_path=dataset,
+        config=NeuralTrainingConfig(
+            method="conditional_pca",
+            pca_components=4,
+            beta=0.01,
+            seed=37,
+        ),
+    )
+    train_neural_checkpoint(
+        reverse_guide_checkpoint,
+        dataset_path=dataset,
+        config=NeuralTrainingConfig(
+            method="threshold_conditional_pca",
+            pca_components=4,
+            beta=0.01,
+            subthreshold_weight=3.0,
+            slope_weight=0.3,
+            seed=41,
+        ),
+    )
+    build_hybrid_checkpoint(
+        base_path=base_checkpoint,
+        guide_path=guide_checkpoint,
+        reverse_guide_path=reverse_guide_checkpoint,
+        output_path=hybrid_checkpoint,
+        local_blend=0.82,
+        global_blend=0.06,
+        window_scale=3.0,
+        min_window_v=0.22,
+    )
+
+    engine = ResidualEngine(hybrid_checkpoint)
+    generated = generate_curves(
+        GenerationCondition(
+            variants=1,
+            points=101,
+            gate_ai_residual_strength=1.0,
+            target_vth=2.3,
+            target_ss_mv_dec=140.0,
+        ),
+        engine,
+    )
+    candidate = generated.candidates[0]
+
+    assert engine.metadata["hybrid_directional_guides"] is True
+    assert engine.metadata["reverse_guide_model_name"] == reverse_guide_checkpoint.stem
+    assert candidate.gate_latent_code
+    assert np.all(np.isfinite(candidate.forward_current))
+    assert np.all(np.isfinite(candidate.reverse_current))
+
+
+def test_hybrid_threshold_pca_supports_local_delta_guide(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    base_checkpoint = tmp_path / "base-pca.npz"
+    guide_checkpoint = tmp_path / "local-guide-threshold-pca.npz"
+    hybrid_checkpoint = tmp_path / "hybrid-threshold-local-delta-pca.npz"
+    _write_neural_dataset(dataset, include_gate=True)
+    train_neural_checkpoint(
+        base_checkpoint,
+        dataset_path=dataset,
+        config=NeuralTrainingConfig(
+            method="latent_pca",
+            pca_components=4,
+            seed=47,
+        ),
+    )
+    train_neural_checkpoint(
+        guide_checkpoint,
+        dataset_path=dataset,
+        config=NeuralTrainingConfig(
+            method="local_threshold_conditional_pca",
+            pca_components=4,
+            beta=0.012,
+            subthreshold_weight=3.2,
+            slope_weight=0.35,
+            seed=53,
+        ),
+    )
+    build_hybrid_checkpoint(
+        base_path=base_checkpoint,
+        guide_path=guide_checkpoint,
+        guide_as_local_delta=True,
+        output_path=hybrid_checkpoint,
+        base_scale_multiplier=0.5,
+        local_blend=0.92,
+        global_blend=0.0,
+        window_scale=3.0,
+        min_window_v=0.22,
+        guide_delta_clip_decades=0.18,
+        guide_delta_anchor_strength=1.0,
+        guide_delta_preserve_affine_strength=0.5,
+        post_vth_align_strength=0.25,
+        post_vth_align_reverse_only=True,
+        post_vth_align_local_window_scale=2.5,
+        post_vth_align_local_min_window_v=0.2,
+    )
+
+    engine = ResidualEngine(hybrid_checkpoint)
+    generated = generate_curves(
+        GenerationCondition(
+            variants=1,
+            points=101,
+            gate_ai_residual_strength=1.0,
+            target_vth=2.3,
+            target_ss_mv_dec=140.0,
+        ),
+        engine,
+    )
+    candidate = generated.candidates[0]
+
+    assert engine.metadata["hybrid_guide_as_local_delta"] is True
+    assert engine.metadata["hybrid_base_scale_multiplier"] == 0.5
+    assert engine.metadata["hybrid_guide_delta_anchor_strength"] == 1.0
+    assert engine.metadata["hybrid_guide_delta_preserve_affine_strength"] == 0.5
+    assert engine.metadata["hybrid_post_vth_align_strength"] == 0.25
+    assert engine.metadata["hybrid_post_vth_align_reverse_only"] is True
+    assert engine.metadata["hybrid_post_vth_align_local_window_scale"] == 2.5
+    assert engine.metadata["hybrid_post_vth_align_local_min_window_v"] == 0.2
+    assert candidate.gate_latent_code
+    assert np.all(np.isfinite(candidate.forward_current))
+    assert np.all(np.isfinite(candidate.reverse_current))
 
 
 def test_quick_search_activates_best_trial(tmp_path: Path, monkeypatch) -> None:

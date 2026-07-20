@@ -4,10 +4,19 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.hypothesis/
+.tox/
+.nox/
 .coverage
+.coverage.*
 htmlcov/
 _uv-cache/
 _uv-python/
+_pkg/
+*.egg-info/
+build/
+dist/
 
 # Local database and sensitive runtime state
 .mysql/
@@ -35,13 +44,20 @@ data/
 rawdata/
 analysis_output/
 device_iv_plots/
+experiments/
 *.npz
 *.npy
 
 # Frontend build/install artifacts
 frontend/node_modules/
 frontend/dist/
+frontend/.vite/
+frontend/coverage/
 *.tsbuildinfo
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 frontend/vite.config.js
 frontend/vite.config.d.ts
 
@@ -51,3 +67,5 @@ models/*
 
 # Tooling metadata
 .agents/
+.idea/
+.vscode/

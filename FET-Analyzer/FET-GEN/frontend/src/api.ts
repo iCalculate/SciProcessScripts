@@ -8,6 +8,7 @@ import type {
   CurvePreview,
   CurveFilters,
   CurveListResponse,
+  DatabaseExportOptions,
   CalendarCurveResponse,
   AppMode,
   DatabaseFolderImportOptions,
@@ -15,10 +16,14 @@ import type {
   DatabaseImportSummary,
   DatabaseOptions,
   DatabaseStatus,
+  ExperimentLeaderboardResponse,
   InspectionResponse,
+  ModelComparisonResponse,
   ModelInfo,
   NeuralTrainingConfig,
   NeuralTrainingStatus,
+  MatrixSynthesisRequest,
+  MatrixSynthesisResponse,
   TrainingResult
 } from "./types";
 
@@ -86,6 +91,22 @@ export async function inspectFile(
 export async function getModelInfo(): Promise<ModelInfo> {
   const response = await apiFetch("/api/model");
   return readJson<ModelInfo>(response);
+}
+
+export async function compareModels(
+  condition: GenerationCondition
+): Promise<ModelComparisonResponse> {
+  const response = await apiFetch("/api/model/compare", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ condition })
+  });
+  return readJson<ModelComparisonResponse>(response);
+}
+
+export async function getModelLeaderboard(): Promise<ExperimentLeaderboardResponse> {
+  const response = await apiFetch("/api/model/leaderboard");
+  return readJson<ExperimentLeaderboardResponse>(response);
 }
 
 export async function getRuntimeConfig(): Promise<{ app_mode: AppMode }> {
@@ -344,12 +365,17 @@ export async function startDatabaseAnalysis(
 }
 
 export async function exportDatabaseSelection(
-  selection: DatabaseSelectionState
+  selection: DatabaseSelectionState,
+  options?: DatabaseExportOptions
 ): Promise<void> {
   const response = await apiFetch("/api/database/export", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: selectionBody(selection)
+    body: JSON.stringify({
+      curve_ids: selection.allFiltered ? [] : selection.selectedIds,
+      filters: selection.allFiltered ? selection.filters : {},
+      export_options: options
+    })
   });
   if (!response.ok) {
     await readJson<never>(response);
@@ -360,6 +386,40 @@ export async function exportDatabaseSelection(
   const anchor = document.createElement("a");
   anchor.href = url;
   anchor.download = "devicecurvegen-database-selection.zip";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+export async function synthesizeMatrix(
+  request: MatrixSynthesisRequest
+): Promise<MatrixSynthesisResponse> {
+  const response = await apiFetch("/api/database/matrix-synthesize", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request)
+  });
+  return readJson<MatrixSynthesisResponse>(response);
+}
+
+export async function exportMatrixWorkbook(
+  request: MatrixSynthesisRequest
+): Promise<void> {
+  const response = await apiFetch("/api/database/matrix-export", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request)
+  });
+  if (!response.ok) {
+    await readJson<never>(response);
+    return;
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = "devicecurvegen-matrix-output.xlsx";
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();

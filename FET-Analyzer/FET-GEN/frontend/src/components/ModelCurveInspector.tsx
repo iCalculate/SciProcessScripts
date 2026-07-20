@@ -3,11 +3,11 @@ import createPlotlyComponent from "react-plotly.js/factory";
 import Plotly from "plotly.js-basic-dist-min";
 import type { Data, Layout } from "plotly.js";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { generateCurves } from "../api";
+import { compareModels } from "../api";
 import type {
-  GeneratedCandidate,
   GenerationCondition,
-  GenerationResponse,
+  ModelComparisonItem,
+  ModelComparisonResponse,
   ModelInfo
 } from "../types";
 
@@ -40,16 +40,38 @@ const PREVIEW_CONDITION: GenerationCondition = {
   mobility_sigma_fraction: 0.05,
   contact_resistance_ohm: 1e4,
   contact_resistance_sigma_fraction: 0.08,
-  ai_residual_strength: 1,
-  gate_ai_residual_strength: 1,
-  physical_strictness: 0.45,
+  ai_residual_strength: 1.0,
+  gate_ai_residual_strength: 1.0,
   diversity: 0.8,
   seed: 12345,
   voltage_min: -20,
   voltage_max: 20,
   points: 401,
-  variants: 4
+  variants: 1
 };
+
+const PROFILE_COLORS: Record<string, string> = {
+  physics_only: "#7d8ca0",
+  procedural_prior: "#d95f02",
+  active_model: "#1769ff",
+  best_jump_model: "#d1495b",
+  best_canonical_model: "#6d28d9",
+  best_weighted_model: "#1b8f6a"
+};
+
+function profileColor(key: string) {
+  return PROFILE_COLORS[key] ?? "#1769ff";
+}
+
+function residualLabel(item: ModelComparisonItem) {
+  if (item.model.architecture === "hybrid_threshold_pca") return "Hybrid threshold PCA";
+  if (item.model.architecture === "conditional_pca") return "Conditioned PCA";
+  return item.residual_mode === "conditional_vae"
+    ? "Conditional VAE"
+    : item.residual_mode === "learned_pca"
+      ? "Learned PCA"
+      : "Procedural prior";
+}
 
 function InspectorField({
   label,
@@ -93,91 +115,94 @@ function finitePositiveRange(values: number[][], fallback: [number, number]) {
 }
 
 function buildTraces(
-  response: GenerationResponse,
-  selected: GeneratedCandidate
+  comparison: ModelComparisonResponse,
+  focusedKey: string
 ): Data[] {
-  const otherTraces = response.candidates
-    .filter((candidate) => candidate.candidate_id !== selected.candidate_id)
-    .flatMap(
-      (candidate) =>
-        [
-          {
-            x: candidate.voltage,
-            y: candidate.forward_current,
-            type: "scatter",
-            mode: "lines",
-            xaxis: "x",
-            yaxis: "y",
-            hoverinfo: "skip",
-            line: { color: "rgba(23, 105, 255, 0.13)", width: 1 },
-            showlegend: false
-          },
-          {
-            x: candidate.voltage,
-            y: candidate.gate_forward_current,
-            type: "scatter",
-            mode: "lines",
-            xaxis: "x2",
-            yaxis: "y2",
-            hoverinfo: "skip",
-            line: { color: "rgba(217, 95, 2, 0.14)", width: 1 },
-            showlegend: false
-          }
-        ] as Data[]
+  const traces: Data[] = [];
+  const focused = comparison.items.find((item) => item.key === focusedKey) ?? comparison.items[0];
+  if (focused) {
+    traces.push({
+      x: focused.candidate.voltage,
+      y: focused.candidate.physics_forward_current,
+      type: "scatter",
+      mode: "lines",
+      xaxis: "x",
+      yaxis: "y",
+      name: "Physics baseline",
+      line: { color: "#97a5b7", width: 1.3, dash: "dash" }
+    });
+  }
+  comparison.items.forEach((item) => {
+    const color = profileColor(item.key);
+    const emphasized = item.key === focusedKey;
+    traces.push(
+      {
+        x: item.candidate.voltage,
+        y: item.candidate.forward_current,
+        type: "scatter",
+        mode: "lines",
+        xaxis: "x",
+        yaxis: "y",
+        name: `${item.label} Ids`,
+        legendgroup: item.key,
+        line: {
+          color,
+          width: emphasized ? 3.1 : 2.0
+        }
+      },
+      {
+        x: item.candidate.voltage,
+        y: item.candidate.reverse_current,
+        type: "scatter",
+        mode: "lines",
+        xaxis: "x",
+        yaxis: "y",
+        showlegend: false,
+        legendgroup: item.key,
+        hoverinfo: "skip",
+        line: {
+          color,
+          width: emphasized ? 2.4 : 1.5,
+          dash: "dot"
+        }
+      },
+      {
+        x: item.candidate.voltage,
+        y: item.candidate.gate_forward_current,
+        type: "scatter",
+        mode: "lines",
+        xaxis: "x2",
+        yaxis: "y2",
+        name: `${item.label} Ig`,
+        legendgroup: `${item.key}-ig`,
+        line: {
+          color,
+          width: emphasized ? 2.6 : 1.8
+        }
+      },
+      {
+        x: item.candidate.voltage,
+        y: item.candidate.gate_reverse_current,
+        type: "scatter",
+        mode: "lines",
+        xaxis: "x2",
+        yaxis: "y2",
+        showlegend: false,
+        legendgroup: `${item.key}-ig`,
+        hoverinfo: "skip",
+        line: {
+          color,
+          width: emphasized ? 2.1 : 1.3,
+          dash: "dot"
+        }
+      }
     );
-  return [
-    ...otherTraces,
-    {
-      x: selected.voltage,
-      y: selected.physics_forward_current,
-      type: "scatter",
-      mode: "lines",
-      xaxis: "x",
-      yaxis: "y",
-      name: "Ids physics",
-      line: { color: "#7d8ca0", width: 1.3, dash: "dash" }
-    },
-    {
-      x: selected.voltage,
-      y: selected.forward_current,
-      type: "scatter",
-      mode: "lines",
-      xaxis: "x",
-      yaxis: "y",
-      name: "Ids forward",
-      line: { color: "#1769ff", width: 2.4 }
-    },
-    {
-      x: selected.voltage,
-      y: selected.reverse_current,
-      type: "scatter",
-      mode: "lines",
-      xaxis: "x",
-      yaxis: "y",
-      name: "Ids reverse",
-      line: { color: "#1769ff", width: 1.9, dash: "dot" }
-    },
-    {
-      x: selected.voltage,
-      y: selected.gate_forward_current,
-      type: "scatter",
-      mode: "lines",
-      xaxis: "x2",
-      yaxis: "y2",
-      name: "Ig forward",
-      line: { color: "#d95f02", width: 2.2 }
-    },
-    {
-      x: selected.voltage,
-      y: selected.gate_reverse_current,
-      type: "scatter",
-      mode: "lines",
-      xaxis: "x2",
-      yaxis: "y2",
-      name: "Ig reverse",
-      line: { color: "#d95f02", width: 1.8, dash: "dot" }
-    }
-  ];
+  });
+  return traces;
+}
+
+function metricLabel(value: number | null) {
+  return value === null || !Number.isFinite(value) ? "n/a" : value.toFixed(3);
 }
 
 export function ModelCurveInspector({
@@ -189,20 +214,28 @@ export function ModelCurveInspector({
 }) {
   const [condition, setCondition] =
     useState<GenerationCondition>(PREVIEW_CONDITION);
-  const [response, setResponse] = useState<GenerationResponse | null>(null);
-  const [selectedId, setSelectedId] = useState(1);
+  const [comparison, setComparison] = useState<ModelComparisonResponse | null>(null);
+  const [focusedKey, setFocusedKey] = useState("active_model");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const gateChannelKey = model?.generated_channels.join(",") ?? "";
 
-  const runPreview = useCallback(async (next: GenerationCondition) => {
+  const runComparison = useCallback(async (next: GenerationCondition) => {
     setLoading(true);
     setError(null);
     try {
-      const generated = await generateCurves(next);
-      setResponse(generated);
-      setSelectedId(1);
+      const request = {
+        ...next,
+        variants: 1,
+        gate_ai_residual_strength: next.ai_residual_strength
+      };
+      const generated = await compareModels(request);
+      setComparison(generated);
+      setFocusedKey((current) =>
+        generated.items.some((item) => item.key === current) ? current : "active_model"
+      );
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Curve preview failed");
+      setError(caught instanceof Error ? caught.message : "Model comparison failed");
     } finally {
       setLoading(false);
     }
@@ -212,43 +245,48 @@ export function ModelCurveInspector({
     const supportsGate = model?.generated_channels.includes("Ig") ?? false;
     const next = {
       ...PREVIEW_CONDITION,
-      gate_ai_residual_strength: supportsGate ? 1 : 0
+      gate_ai_residual_strength: supportsGate ? PREVIEW_CONDITION.ai_residual_strength : 0
     };
     setCondition(next);
-    void runPreview(next);
-  }, [model?.checkpoint_path, model?.generated_channels, runPreview]);
+    void runComparison(next);
+  }, [gateChannelKey, model?.checkpoint_path, runComparison]);
 
-  const selected = useMemo(
+  const focused = useMemo(
     () =>
-      response?.candidates.find(
-        (candidate) => candidate.candidate_id === selectedId
-      ) ??
-      response?.candidates[0] ??
+      comparison?.items.find((item) => item.key === focusedKey) ??
+      comparison?.items.find((item) => item.key === "active_model") ??
+      comparison?.items[0] ??
       null,
-    [response, selectedId]
+    [comparison, focusedKey]
   );
+
   const traces = useMemo(
-    () => (response && selected ? buildTraces(response, selected) : []),
-    [response, selected]
+    () => (comparison ? buildTraces(comparison, focused?.key ?? "active_model") : []),
+    [comparison, focused?.key]
   );
-  const idsRange = selected
+
+  const idsRange = focused
     ? finitePositiveRange(
-        [selected.forward_current, selected.reverse_current],
+        comparison?.items.flatMap((item) => [
+          item.candidate.forward_current,
+          item.candidate.reverse_current
+        ]) ?? [],
         [-15, -4]
       )
     : [-15, -4];
-  const igRange = selected
+  const igRange = focused
     ? finitePositiveRange(
-        [selected.gate_forward_current, selected.gate_reverse_current],
+        comparison?.items.flatMap((item) => [
+          item.candidate.gate_forward_current,
+          item.candidate.gate_reverse_current
+        ]) ?? [],
         [-16, -10]
       )
     : [-16, -10];
-  const passedConstraints =
-    selected?.constraints.filter((constraint) => constraint.passed).length ?? 0;
 
   const layout: Partial<Layout> = {
     autosize: true,
-    height: 510,
+    height: 540,
     margin: { l: 68, r: 24, t: 34, b: 52 },
     paper_bgcolor: "#ffffff",
     plot_bgcolor: "#fbfdff",
@@ -293,23 +331,31 @@ export function ModelCurveInspector({
   };
 
   function patchCondition(patch: Partial<GenerationCondition>) {
-    setCondition((current) => ({ ...current, ...patch }));
+    setCondition((current) => {
+      const next = { ...current, ...patch };
+      if (patch.ai_residual_strength !== undefined) {
+        next.gate_ai_residual_strength = patch.ai_residual_strength;
+      }
+      return next;
+    });
   }
 
   return (
     <section className="model-curve-inspector">
       <div className="panel-title-row">
         <div>
-          <h2>Final-model curve inspection</h2>
+          <h2>Model comparison lab</h2>
           <p>
-            Generate concrete Ids and Ig transfer curves from the active checkpoint
-            before accepting the training result.
+            Compare pure physics, the active model, and the best leaderboard
+            checkpoints under one shared physics-to-AI balance slider. The
+            default preview opens at 100% AI to expose threshold-jump behavior
+            directly.
           </p>
         </div>
         <div className="model-inspector-badges">
           <span>
             <FlaskConical size={13} />
-            {response?.model_name ?? model?.model_name ?? "No active model"}
+            {model?.model_name ?? "No active model"}
           </span>
           <span>
             Channels {model?.generated_channels.join(" + ") ?? "Ids"}
@@ -341,9 +387,7 @@ export function ModelCurveInspector({
             label="SS (mV/dec)"
             value={condition.target_ss_mv_dec}
             step={10}
-            onChange={(target_ss_mv_dec) =>
-              patchCondition({ target_ss_mv_dec })
-            }
+            onChange={(target_ss_mv_dec) => patchCondition({ target_ss_mv_dec })}
           />
           <InspectorField
             label="Ig baseline (A)"
@@ -357,8 +401,8 @@ export function ModelCurveInspector({
             step={1}
             onChange={(seed) => patchCondition({ seed: Math.max(0, Math.round(seed)) })}
           />
-          <label className="model-inspector-slider">
-            <span>Ids learned residual</span>
+          <label className="model-inspector-slider model-inspector-slider-wide">
+            <span>Physics {"<->"} AI balance</span>
             <input
               type="range"
               min="0"
@@ -371,43 +415,27 @@ export function ModelCurveInspector({
                 })
               }
             />
-            <strong>{condition.ai_residual_strength.toFixed(2)}</strong>
-          </label>
-          <label className="model-inspector-slider">
-            <span>Ig learned residual</span>
-            <input
-              type="range"
-              min="0"
-              max="1"
-              step="0.05"
-              value={condition.gate_ai_residual_strength}
-              disabled={!model?.generated_channels.includes("Ig")}
-              onChange={(event) =>
-                patchCondition({
-                  gate_ai_residual_strength: Number(event.currentTarget.value)
-                })
-              }
-            />
-            <strong>{condition.gate_ai_residual_strength.toFixed(2)}</strong>
+            <strong>{Math.round(condition.ai_residual_strength * 100)}%</strong>
+            <small>0 = pure formula, 100 = strongest learned morphology blend.</small>
           </label>
           <button
             type="button"
             className="button primary"
             disabled={disabled || loading}
-            onClick={() => void runPreview(condition)}
+            onClick={() => void runComparison(condition)}
           >
             {loading ? (
               <RefreshCw size={15} className="spin" />
             ) : (
               <Sparkles size={15} />
             )}
-            Generate inspection curves
+            Generate comparison
           </button>
           {error ? <div className="model-inspector-error">{error}</div> : null}
         </aside>
 
         <div className="model-inspector-plot">
-          {selected ? (
+          {comparison && focused ? (
             <Plot
               data={traces}
               layout={layout}
@@ -417,64 +445,98 @@ export function ModelCurveInspector({
                 modeBarButtonsToRemove: ["lasso2d", "select2d"]
               }}
               useResizeHandler
-              style={{ width: "100%", height: "510px" }}
+              style={{ width: "100%", height: "540px" }}
             />
           ) : (
             <div className="model-inspector-empty">
-              {loading ? "Generating curves" : "No inspection curves available"}
+              {loading ? "Generating model comparison" : "No model comparison available"}
             </div>
           )}
         </div>
       </div>
 
-      {response && selected ? (
-        <div className="model-inspector-summary">
-          <div className="model-inspector-candidates">
-            {response.candidates.map((candidate) => (
+      {comparison ? (
+        <div className="model-comparison-cards">
+          {comparison.items.map((item) => {
+            const passedConstraints = item.candidate.constraints.filter(
+              (constraint) => constraint.passed
+            ).length;
+            const active = focused?.key === item.key;
+            const experiment = item.experiment_summary;
+            return (
               <button
                 type="button"
-                key={candidate.candidate_id}
-                className={candidate.candidate_id === selectedId ? "active" : undefined}
-                onClick={() => setSelectedId(candidate.candidate_id)}
+                key={item.key}
+                className={`model-comparison-card${active ? " active" : ""}`}
+                onClick={() => setFocusedKey(item.key)}
               >
-                #{candidate.candidate_id}
-                <small>Q {candidate.quality_score.toFixed(3)}</small>
+                <div className="model-comparison-card-top">
+                  <span
+                    className="model-comparison-swatch"
+                    style={{ backgroundColor: profileColor(item.key) }}
+                  />
+                  <div>
+                    <strong>{item.label}</strong>
+                    <small>{residualLabel(item)}</small>
+                  </div>
+                </div>
+                <p>{item.description}</p>
+                <dl>
+                  <div>
+                    <dt>Quality</dt>
+                    <dd>{item.candidate.quality_score.toFixed(3)}</dd>
+                  </div>
+                  <div>
+                    <dt>Blend</dt>
+                    <dd>{Math.round(item.ai_residual_strength * 100)}%</dd>
+                  </div>
+                  <div>
+                    <dt>Vth</dt>
+                    <dd>{metricLabel(item.candidate.features.vth)} V</dd>
+                  </div>
+                  <div>
+                    <dt>SS</dt>
+                    <dd>{metricLabel(item.candidate.features.ss_mv_dec)} mV/dec</dd>
+                  </div>
+                  <div>
+                    <dt>Ioff</dt>
+                    <dd>{item.candidate.features.ioff.toExponential(2)} A</dd>
+                  </div>
+                  <div>
+                    <dt>Constraints</dt>
+                    <dd>
+                      <CheckCircle2 size={13} />
+                      {passedConstraints}/{item.candidate.constraints.length}
+                    </dd>
+                  </div>
+                  {experiment ? (
+                    <>
+                      <div>
+                        <dt>Jump P95</dt>
+                        <dd>{metricLabel(experiment.jump_p95_decades)}</dd>
+                      </div>
+                      <div>
+                        <dt>Canon. jump</dt>
+                        <dd>{metricLabel(experiment.canonical_jump_max_decades)}</dd>
+                      </div>
+                      <div>
+                        <dt>Gen. Vth</dt>
+                        <dd>{metricLabel(experiment.generated_vth_mae_v)} V</dd>
+                      </div>
+                      <div>
+                        <dt>Gen. SS</dt>
+                        <dd>{metricLabel(experiment.generated_ss_mae_mv_dec)} mV/dec</dd>
+                      </div>
+                      <div>
+                        <dt>Weighted</dt>
+                        <dd>{metricLabel(experiment.validation_weighted_rmse_decades)}</dd>
+                      </div>
+                    </>
+                  ) : null}
+                </dl>
               </button>
-            ))}
-          </div>
-          <dl>
-            <div>
-              <dt>Ion</dt>
-              <dd>{selected.features.ion.toExponential(3)} A</dd>
-            </div>
-            <div>
-              <dt>Ioff</dt>
-              <dd>{selected.features.ioff.toExponential(3)} A</dd>
-            </div>
-            <div>
-              <dt>Vth</dt>
-              <dd>
-                {selected.features.vth === null
-                  ? "n/a"
-                  : `${selected.features.vth.toFixed(3)} V`}
-              </dd>
-            </div>
-            <div>
-              <dt>SS</dt>
-              <dd>
-                {selected.features.ss_mv_dec === null
-                  ? "n/a"
-                  : `${selected.features.ss_mv_dec.toFixed(1)} mV/dec`}
-              </dd>
-            </div>
-            <div>
-              <dt>Constraints</dt>
-              <dd>
-                <CheckCircle2 size={13} />
-                {passedConstraints}/{selected.constraints.length}
-              </dd>
-            </div>
-          </dl>
+            );
+          })}
         </div>
       ) : null}
     </section>

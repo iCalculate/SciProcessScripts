@@ -4,11 +4,12 @@ import hashlib
 import os
 import statistics
 import time
+from collections.abc import Callable
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 from sqlalchemy import (
@@ -519,94 +520,99 @@ def _source_file_is_unchanged(
     return True
 
 
-def import_b1500_to_mysql(
-    source: Path,
-    database_url: str | None = None,
+def _mysql_lock_error_code(error: OperationalError) -> int | None:
+    original = getattr(error, "orig", None)
+    args = getattr(original, "args", ())
+    if not args:
+        return None
+    try:
+        return int(args[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _run_with_mysql_lock_retry(operation: Callable[[], Any], *, attempts: int = 6) -> Any:
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except OperationalError as error:
+            if _mysql_lock_error_code(error) not in {1205, 1213} or attempt == attempts - 1:
+                raise
+            time.sleep(0.4 * (attempt + 1))
+    raise RuntimeError("unreachable")
+
+
+def _source_file_row(connection: Any, source_path: str) -> dict[str, Any] | None:
+    row = connection.execute(
+        select(
+            source_files.c.id,
+            source_files.c.source_path,
+            source_files.c.size_bytes,
+            source_files.c.modified_at,
+            source_files.c.sha1,
+        ).where(source_files.c.source_path == source_path)
+    ).mappings().first()
+    return dict(row) if row is not None else None
+
+
+def _record_import_rejection_with_retry(
+    engine: Engine,
     *,
-    replace: bool = False,
-    suffixes: set[str] | None = None,
-    max_xml_mb: float = 128.0,
-    hash_files: bool = False,
+    source_path: str,
+    table_name: str | None,
+    reason: str,
+) -> None:
+    def operation() -> None:
+        with engine.begin() as connection:
+            existing = _source_file_row(connection, source_path)
+            _record_rejection(
+                connection,
+                source_file_id=int(existing["id"]) if existing else None,
+                source_path=source_path,
+                table_name=table_name,
+                reason=reason,
+            )
+
+    _run_with_mysql_lock_retry(operation)
+
+
+def _import_b1500_file_rows(
+    engine: Engine,
+    *,
+    path: Path,
+    relative_path: str,
+    stat: os.stat_result,
+    modified_at: datetime,
+    sha1: str | None,
+    tables: list[Any],
 ) -> dict[str, Any]:
-    source = source.resolve()
-    if not source.is_dir():
-        raise ValueError(f"Source directory does not exist: {source}")
-    engine = create_database_engine(database_url)
-    create_schema(engine)
-    if replace:
-        reset_schema_data(engine)
-
-    allowed_suffixes = _normalize_suffixes(suffixes)
-    files = sorted(
-        path
-        for path in source.rglob("*")
-        if path.is_file() and path.suffix.lower() in allowed_suffixes
-    )
-    accepted_segments = 0
-    rejected_count = 0
-    skipped_files = 0
-    imported_files = 0
-    updated_files = 0
-    raw_batch: list[dict[str, Any]] = []
-    gate_batch: list[dict[str, Any]] = []
-    aligned_batch: list[dict[str, Any]] = []
-    aligned_gate_batch: list[dict[str, Any]] = []
-
-    with engine.begin() as connection:
-        existing_by_path = {
-            str(row["source_path"]): dict(row)
-            for row in connection.execute(
-                select(
-                    source_files.c.id,
-                    source_files.c.source_path,
-                    source_files.c.size_bytes,
-                    source_files.c.modified_at,
-                    source_files.c.sha1,
-                )
-            ).mappings()
+    def operation() -> dict[str, Any]:
+        raw_batch: list[dict[str, Any]] = []
+        gate_batch: list[dict[str, Any]] = []
+        aligned_batch: list[dict[str, Any]] = []
+        aligned_gate_batch: list[dict[str, Any]] = []
+        summary = {
+            "files_imported": 0,
+            "files_updated": 0,
+            "accepted_transfer_segments": 0,
+            "rejected_entries": 0,
+            "source_file": {
+                "id": None,
+                "source_path": relative_path,
+                "size_bytes": stat.st_size,
+                "modified_at": modified_at,
+                "sha1": sha1,
+            },
         }
-        for file_index, path in enumerate(files, start=1):
-            stat = path.stat()
-            relative_path = _safe_relpath(path, source)
-            modified_at = datetime.fromtimestamp(stat.st_mtime)
-            existing = existing_by_path.get(relative_path)
-            sha1 = _file_sha1(path) if hash_files else None
-            if existing and _source_file_is_unchanged(
-                existing,
-                size_bytes=stat.st_size,
-                modified_at=modified_at,
-                sha1=sha1,
-            ):
-                skipped_files += 1
-                continue
-            try:
-                tables = parse_source(path, max_xml_mb=max_xml_mb)
-            except (OSError, ValueError) as error:
-                _record_rejection(
-                    connection,
-                    source_file_id=int(existing["id"]) if existing else None,
-                    source_path=relative_path,
-                    table_name=None,
-                    reason=str(error),
-                )
-                rejected_count += 1
-                continue
-            if not tables:
-                _record_rejection(
-                    connection,
-                    source_file_id=int(existing["id"]) if existing else None,
-                    source_path=relative_path,
-                    table_name=None,
-                    reason="no numeric B1500 data table found",
-                )
-                rejected_count += 1
-                continue
-
+        with engine.begin() as connection:
+            existing = _source_file_row(connection, relative_path)
             if existing:
-                connection.execute(delete(source_files).where(source_files.c.id == int(existing["id"])))
-                updated_files += 1
+                connection.execute(
+                    delete(source_files).where(source_files.c.id == int(existing["id"]))
+                )
+                summary["files_updated"] = 1
             else:
-                imported_files += 1
+                summary["files_imported"] = 1
             source_result = connection.execute(
                 insert(source_files).values(
                     source_path=relative_path,
@@ -618,13 +624,7 @@ def import_b1500_to_mysql(
                 )
             )
             source_file_id = int(source_result.inserted_primary_key[0])
-            existing_by_path[relative_path] = {
-                "id": source_file_id,
-                "source_path": relative_path,
-                "size_bytes": stat.st_size,
-                "modified_at": modified_at,
-                "sha1": sha1,
-            }
+            summary["source_file"]["id"] = source_file_id
 
             for table in tables:
                 choice = choose_columns(table)
@@ -636,7 +636,7 @@ def import_b1500_to_mysql(
                         table_name=table.table_name,
                         reason="no content-level FET transfer/output column pattern",
                     )
-                    rejected_count += 1
+                    summary["rejected_entries"] += 1
                     continue
                 metadata_json = _clean_json(table.metadata)
                 config_result = connection.execute(
@@ -666,7 +666,7 @@ def import_b1500_to_mysql(
                         table_name=table.table_name,
                         reason=f"content classified as {choice.curve_type}, not transfer",
                     )
-                    rejected_count += 1
+                    summary["rejected_entries"] += 1
                     continue
 
                 cleaned = _clean_pair(table.frame, choice.voltage, choice.current)
@@ -684,7 +684,7 @@ def import_b1500_to_mysql(
                         table_name=table.table_name,
                         reason=rejection,
                     )
-                    rejected_count += 1
+                    summary["rejected_entries"] += 1
                     continue
 
                 segments = _segment_sweeps(
@@ -740,7 +740,7 @@ def import_b1500_to_mysql(
                             table_name=table.table_name,
                             reason="segment lacks stable transfer features",
                         )
-                        rejected_count += 1
+                        summary["rejected_entries"] += 1
                         continue
 
                     physical_grid, aligned_log_current, aligned_current = _align_segment(
@@ -860,17 +860,114 @@ def import_b1500_to_mysql(
                         )
                         if len(aligned_batch) >= BATCH_SIZE:
                             _insert_many(connection, aligned_points, aligned_batch)
-                    accepted_segments += 1
-            if file_index % 500 == 0:
-                print(
-                    f"Imported {file_index}/{len(files)} files; "
-                    f"accepted {accepted_segments} segments",
-                    flush=True,
+                    summary["accepted_transfer_segments"] += 1
+            _insert_many(connection, raw_points, raw_batch)
+            _insert_many(connection, raw_gate_points, gate_batch)
+            _insert_many(connection, aligned_points, aligned_batch)
+            _insert_many(connection, aligned_gate_points, aligned_gate_batch)
+        return summary
+
+    return _run_with_mysql_lock_retry(operation)
+
+
+def import_b1500_to_mysql(
+    source: Path,
+    database_url: str | None = None,
+    *,
+    replace: bool = False,
+    suffixes: set[str] | None = None,
+    max_xml_mb: float = 128.0,
+    hash_files: bool = False,
+) -> dict[str, Any]:
+    source = source.resolve()
+    if not source.is_dir():
+        raise ValueError(f"Source directory does not exist: {source}")
+    engine = create_database_engine(database_url)
+    create_schema(engine)
+    if replace:
+        reset_schema_data(engine)
+
+    allowed_suffixes = _normalize_suffixes(suffixes)
+    files = sorted(
+        path
+        for path in source.rglob("*")
+        if path.is_file() and path.suffix.lower() in allowed_suffixes
+    )
+    accepted_segments = 0
+    rejected_count = 0
+    skipped_files = 0
+    imported_files = 0
+    updated_files = 0
+
+    with engine.connect() as connection:
+        existing_by_path = {
+            str(row["source_path"]): dict(row)
+            for row in connection.execute(
+                select(
+                    source_files.c.id,
+                    source_files.c.source_path,
+                    source_files.c.size_bytes,
+                    source_files.c.modified_at,
+                    source_files.c.sha1,
                 )
-        _insert_many(connection, raw_points, raw_batch)
-        _insert_many(connection, raw_gate_points, gate_batch)
-        _insert_many(connection, aligned_points, aligned_batch)
-        _insert_many(connection, aligned_gate_points, aligned_gate_batch)
+            ).mappings()
+        }
+
+    for file_index, path in enumerate(files, start=1):
+        stat = path.stat()
+        relative_path = _safe_relpath(path, source)
+        modified_at = datetime.fromtimestamp(stat.st_mtime)
+        existing = existing_by_path.get(relative_path)
+        sha1 = _file_sha1(path) if hash_files else None
+        if existing and _source_file_is_unchanged(
+            existing,
+            size_bytes=stat.st_size,
+            modified_at=modified_at,
+            sha1=sha1,
+        ):
+            skipped_files += 1
+            continue
+        try:
+            tables = parse_source(path, max_xml_mb=max_xml_mb)
+        except (OSError, ValueError) as error:
+            _record_import_rejection_with_retry(
+                engine,
+                source_path=relative_path,
+                table_name=None,
+                reason=str(error),
+            )
+            rejected_count += 1
+            continue
+        if not tables:
+            _record_import_rejection_with_retry(
+                engine,
+                source_path=relative_path,
+                table_name=None,
+                reason="no numeric B1500 data table found",
+            )
+            rejected_count += 1
+            continue
+
+        file_summary = _import_b1500_file_rows(
+            engine,
+            path=path,
+            relative_path=relative_path,
+            stat=stat,
+            modified_at=modified_at,
+            sha1=sha1,
+            tables=tables,
+        )
+        imported_files += int(file_summary["files_imported"])
+        updated_files += int(file_summary["files_updated"])
+        accepted_segments += int(file_summary["accepted_transfer_segments"])
+        rejected_count += int(file_summary["rejected_entries"])
+        existing_by_path[relative_path] = dict(file_summary["source_file"])
+        if file_index % 500 == 0:
+            print(
+                f"Imported {file_index}/{len(files)} files; "
+                f"accepted {accepted_segments} segments",
+                flush=True,
+            )
 
     return {
         "source": str(source),
@@ -1496,6 +1593,150 @@ def list_curves(
         item["log_ratio"] = float(np.log10(ratio)) if ratio and ratio > 0 else None
         item["has_gate_current"] = bool(item.get("has_gate_current"))
     return {"total": int(total), "limit": limit, "offset": offset, "items": items}
+
+
+MATRIX_MATCH_COLUMNS = {
+    "target_ion": curves.c.ion,
+    "target_ioff": curves.c.ioff,
+    "ion_ioff_ratio": curves.c.ion_ioff_ratio,
+    "target_vth": curves.c.vth,
+    "target_ss_mv_dec": curves.c.ss_mv_dec,
+    "hysteresis_v": curves.c.hysteresis_v,
+}
+
+
+def _matrix_score(row: dict[str, Any], targets: dict[str, float]) -> dict[str, Any] | None:
+    score = 0.0
+    weight = 0
+    features: list[str] = []
+    for key, target in targets.items():
+        if key not in MATRIX_MATCH_COLUMNS or target is None:
+            continue
+        value = row.get(key)
+        if value is None:
+            continue
+        try:
+            measured = float(value)
+            requested = float(target)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(measured) or not np.isfinite(requested):
+            continue
+        if key in {"target_ion", "target_ioff", "ion_ioff_ratio"}:
+            if measured <= 0 or requested <= 0:
+                continue
+            score += abs(np.log10(measured) - np.log10(requested))
+        elif key == "target_ss_mv_dec":
+            score += abs(measured - requested) / max(abs(requested) * 0.2, 20.0)
+        else:
+            score += abs(measured - requested) / max(abs(requested) * 0.2, 0.25)
+        weight += 1
+        features.append(key)
+    if weight == 0:
+        return None
+    return {"score": float(score / weight), "features": features}
+
+
+def match_matrix_sites(
+    database_url: str | None = None,
+    *,
+    site_targets: list[dict[str, Any]],
+    filters: dict[str, Any] | None = None,
+    duplicate_mode: str = "allow",
+    max_candidates: int = 50_000,
+) -> list[dict[str, Any]]:
+    engine = create_database_engine(database_url)
+    create_schema(engine)
+    joined = curves.join(
+        source_files,
+        curves.c.source_file_id == source_files.c.id,
+    ).join(
+        test_configs,
+        curves.c.test_config_id == test_configs.c.id,
+    )
+    conditions = _curve_filter_conditions(filters or {})
+    query = (
+        select(
+            curves.c.curve_id,
+            curves.c.polarity,
+            curves.c.direction,
+            curves.c.ion.label("target_ion"),
+            curves.c.ioff.label("target_ioff"),
+            curves.c.ion_ioff_ratio.label("ion_ioff_ratio"),
+            curves.c.vth.label("target_vth"),
+            curves.c.ss_mv_dec.label("target_ss_mv_dec"),
+            curves.c.hysteresis_v.label("hysteresis_v"),
+            source_files.c.source_path,
+            test_configs.c.source_kind,
+        )
+        .select_from(joined)
+        .order_by(curves.c.curve_id)
+        .limit(max_candidates)
+    )
+    if conditions:
+        query = query.where(and_(*conditions))
+    with engine.connect() as connection:
+        candidates = [dict(row) for row in connection.execute(query).mappings()]
+
+    used_curve_ids: set[str] = set()
+    assignments: list[dict[str, Any]] = []
+    for site in site_targets:
+        targets = {
+            key: value
+            for key, value in (site.get("parameters") or {}).items()
+            if key in MATRIX_MATCH_COLUMNS and value is not None
+        }
+        scored = []
+        for row in candidates:
+            curve_id = str(row["curve_id"])
+            score_result = _matrix_score(row, targets)
+            if score_result is None:
+                continue
+            if duplicate_mode in {"avoid", "generate_on_duplicate"} and curve_id in used_curve_ids:
+                continue
+            scored.append((float(score_result["score"]), row, score_result["features"]))
+        if not scored and duplicate_mode == "generate_on_duplicate":
+            assignments.append({**site, "source": "generated", "reason": "duplicate_fallback"})
+            continue
+        if not scored and duplicate_mode == "avoid":
+            assignments.append({**site, "source": "unmatched", "reason": "no_unique_match"})
+            continue
+        if not scored:
+            assignments.append({**site, "source": "unmatched", "reason": "no_match"})
+            continue
+        score, row, score_features = min(
+            scored,
+            key=lambda item: (item[0], str(item[1]["curve_id"])),
+        )
+        curve_id = str(row["curve_id"])
+        reused = curve_id in used_curve_ids
+        used_curve_ids.add(curve_id)
+        assignments.append(
+            {
+                **site,
+                "source": "database",
+                "curve_id": curve_id,
+                "score": score,
+                "score_features": score_features,
+                "reused": reused,
+                "matched": {
+                    key: row.get(key)
+                    for key in [
+                        "target_ion",
+                        "target_ioff",
+                        "ion_ioff_ratio",
+                        "target_vth",
+                        "target_ss_mv_dec",
+                        "hysteresis_v",
+                    ]
+                },
+                "polarity": row.get("polarity"),
+                "direction": row.get("direction"),
+                "source_kind": row.get("source_kind"),
+                "source_path": row.get("source_path"),
+            }
+        )
+    return assignments
 
 
 def calendar_curves(

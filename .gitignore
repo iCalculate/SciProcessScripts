@@ -16,3 +16,8 @@ preferences.json
 # OS / editor cruft
 .DS_Store
 Thumbs.db
+
+# Workspace-local transient test/training artifacts
+pytest-temp*/
+**/pytest-temp*/
+*.tmp.npz

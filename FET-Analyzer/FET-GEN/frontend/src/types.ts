@@ -1,4 +1,4 @@
-export type TabName = "Generate" | "Import" | "Database" | "Analysis" | "Models";
+export type TabName = "Generate" | "Import" | "Database" | "Matrix" | "Analysis" | "Models";
 export type AppMode = "full" | "generate" | "import" | "analysis" | "training";
 
 export interface GenerationCondition {
@@ -30,7 +30,6 @@ export interface GenerationCondition {
   contact_resistance_sigma_fraction: number;
   ai_residual_strength: number;
   gate_ai_residual_strength: number;
-  physical_strictness: number;
   diversity: number;
   seed: number;
   voltage_min: number;
@@ -141,6 +140,9 @@ export interface ModelInfo {
   source: string | null;
   training_config: Partial<NeuralTrainingConfig> | null;
   training_history: NeuralEpochMetric[];
+  condition_features: string[];
+  sample_balance_strategy: string | null;
+  rare_curve_groups: number | null;
   load_error: string | null;
 }
 
@@ -156,7 +158,16 @@ export interface NeuralEpochMetric {
 }
 
 export interface NeuralTrainingConfig {
-  method: "physics_cvae" | "latent_pca";
+  method:
+    | "physics_cvae"
+    | "aligned_local_delta_cvae"
+    | "latent_pca"
+    | "conditional_pca"
+    | "threshold_conditional_pca"
+    | "local_threshold_conditional_pca"
+    | "aligned_local_threshold_conditional_pca"
+    | "aligned_local_delta_conditional_pca"
+    | "aligned_local_affine_delta_conditional_pca";
   search_strategy: "single" | "quick";
   search_trials: number;
   data_source: "export" | "database";
@@ -175,12 +186,41 @@ export interface NeuralTrainingConfig {
   subthreshold_weight: number;
   slope_weight: number;
   gate_loss_weight: number;
+  rare_curve_weight: number;
   pca_components: number;
   feature_eval_limit: number;
 }
 
+export interface ModelComparisonItem {
+  key: string;
+  label: string;
+  description: string;
+  residual_mode: "conditional_vae" | "learned_pca" | "procedural_prior";
+  model_name: string;
+  checkpoint_path: string | null;
+  ai_residual_strength: number;
+  gate_ai_residual_strength: number;
+  model: ModelInfo;
+  candidate: GeneratedCandidate;
+  experiment_summary: ExperimentLeaderboardEntry | null;
+}
+
+export interface ModelComparisonResponse {
+  condition: GenerationCondition;
+  items: ModelComparisonItem[];
+}
+
 export interface NeuralTrainingResult {
-  method: "physics_cvae" | "latent_pca";
+  method:
+    | "physics_cvae"
+    | "aligned_local_delta_cvae"
+    | "latent_pca"
+    | "conditional_pca"
+    | "threshold_conditional_pca"
+    | "local_threshold_conditional_pca"
+    | "aligned_local_threshold_conditional_pca"
+    | "aligned_local_delta_conditional_pca"
+    | "aligned_local_affine_delta_conditional_pca";
   curves: number;
   gate_curves: number;
   generated_channels: ("Ids" | "Ig")[];
@@ -209,7 +249,16 @@ export interface NeuralTrainingResult {
 
 export interface NeuralTrialSummary {
   trial: number;
-  method: "physics_cvae" | "latent_pca";
+  method:
+    | "physics_cvae"
+    | "aligned_local_delta_cvae"
+    | "latent_pca"
+    | "conditional_pca"
+    | "threshold_conditional_pca"
+    | "local_threshold_conditional_pca"
+    | "aligned_local_threshold_conditional_pca"
+    | "aligned_local_delta_conditional_pca"
+    | "aligned_local_affine_delta_conditional_pca";
   latent_dim: number;
   hidden_dim: number;
   learning_rate: number;
@@ -245,6 +294,35 @@ export interface NeuralTrainingStatus {
   trials: NeuralTrialSummary[];
   result: NeuralTrainingResult | null;
   error: string | null;
+}
+
+export interface ExperimentLeaderboardEntry {
+  name: string;
+  description: string | null;
+  method: string;
+  architecture: string | null;
+  experiment_path: string;
+  checkpoint_path: string | null;
+  seconds: number | null;
+  validation_rmse_decades: number | null;
+  validation_weighted_rmse_decades: number | null;
+  feature_vth_mae_v: number | null;
+  feature_ss_mae_mv_dec: number | null;
+  jump_p95_decades: number | null;
+  jump_spike_rate: number | null;
+  generated_vth_mae_v: number | null;
+  generated_ss_mae_mv_dec: number | null;
+  canonical_jump_p95_decades: number | null;
+  canonical_jump_max_decades: number | null;
+}
+
+export interface ExperimentLeaderboardResponse {
+  entries: ExperimentLeaderboardEntry[];
+  best_jump_entry: ExperimentLeaderboardEntry | null;
+  best_canonical_entry: ExperimentLeaderboardEntry | null;
+  best_weighted_entry: ExperimentLeaderboardEntry | null;
+  report_path: string | null;
+  comparison_artifact_url: string | null;
 }
 
 export interface DatabaseAnalysisStatus {
@@ -472,6 +550,16 @@ export interface DatabaseSelectionState {
   total: number;
 }
 
+export interface DatabaseExportOptions {
+  xyxy_curves: boolean;
+  curve_metadata: boolean;
+  raw_id_points: boolean;
+  include_ig: boolean;
+  raw_ig_points: boolean;
+  aligned_ig_points: boolean;
+  analysis_json: boolean;
+}
+
 export interface AnalysisMetricStats {
   count: number;
   min: number | null;
@@ -596,4 +684,77 @@ export interface DatabaseAnalysisResponse {
     voltage_span_min: number | null;
     voltage_span_max: number | null;
   };
+}
+
+export type MatrixParameterKey =
+  | "target_ion"
+  | "target_ioff"
+  | "ion_ioff_ratio"
+  | "target_vth"
+  | "target_ss_mv_dec"
+  | "hysteresis_v"
+  | "mobility_cm2_vs"
+  | "contact_resistance_ohm"
+  | "gate_leakage_a";
+
+export type MatrixSynthesisMode = "database" | "generate";
+export type MatrixDuplicateMode = "allow" | "avoid" | "generate_on_duplicate";
+
+export interface MatrixParameterMap {
+  key: MatrixParameterKey;
+  values: number[][];
+}
+
+export interface MatrixSynthesisRequest {
+  rows: number;
+  cols: number;
+  mode: MatrixSynthesisMode;
+  duplicate_mode: MatrixDuplicateMode;
+  parameters: MatrixParameterMap[];
+  filters: CurveFilters;
+  generation_condition: GenerationCondition;
+}
+
+export interface MatrixGeneratedPayload {
+  seed: number;
+  quality_score: number;
+  features: ExtractedFeatures;
+  voltage: number[];
+  forward_current: number[];
+  reverse_current: number[];
+  gate_forward_current: number[];
+  gate_reverse_current: number[];
+}
+
+export interface MatrixAssignment {
+  site: string;
+  row: number;
+  col: number;
+  parameters: Partial<Record<MatrixParameterKey, number>>;
+  source: "database" | "generated" | "unmatched";
+  reason?: string;
+  curve_id?: string;
+  score?: number;
+  score_features?: MatrixParameterKey[];
+  reused?: boolean;
+  matched?: Partial<Record<MatrixParameterKey, number>> & {
+    ion_ioff_ratio?: number;
+  };
+  polarity?: string;
+  direction?: string;
+  source_kind?: string;
+  source_path?: string;
+  generated?: MatrixGeneratedPayload;
+}
+
+export interface MatrixSynthesisResponse {
+  rows: number;
+  cols: number;
+  mode: MatrixSynthesisMode;
+  duplicate_mode: MatrixDuplicateMode;
+  assignments: MatrixAssignment[];
+  matched_count: number;
+  generated_count: number;
+  unmatched_count: number;
+  reused_count: number;
 }

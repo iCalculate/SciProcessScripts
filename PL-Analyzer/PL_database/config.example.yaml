@@ -1,0 +1,36 @@
+importer:
+  backend: "witio"
+  mock_mode: false
+
+witec:
+  extraction_mode: "auto"
+  manual_x_paths: []
+  manual_y_paths: []
+  skip_keywords:
+    - image
+    - map
+    - mapping
+    - topography
+    - video
+    - camera
+    - hyperspectral
+  spectrum_keywords:
+    - spectrum
+    - graph
+    - raman
+    - pl
+    - photoluminescence
+    - intensity
+
+database:
+  sqlite_path: "data/database/pl_spectra.sqlite3"
+  hdf5_path: "data/hdf5/pl_spectra.h5"
+  export_root: "data/exported"
+  log_root: "data/logs"
+
+api:
+  host: "127.0.0.1"
+  port: 8110
+  cors_origins:
+    - "http://127.0.0.1:5173"
+    - "http://localhost:5173"

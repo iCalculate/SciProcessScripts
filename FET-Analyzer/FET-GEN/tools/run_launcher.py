@@ -24,6 +24,16 @@ ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 FRONTEND_DIR = ROOT / "frontend"
 FRONTEND_DIST = FRONTEND_DIR / "dist" / "index.html"
+FRONTEND_BUILD_INPUTS = (
+    FRONTEND_DIR / "src",
+    FRONTEND_DIR / "index.html",
+    FRONTEND_DIR / "package.json",
+    FRONTEND_DIR / "pnpm-lock.yaml",
+    FRONTEND_DIR / "tsconfig.app.json",
+    FRONTEND_DIR / "tsconfig.json",
+    FRONTEND_DIR / "tsconfig.node.json",
+    FRONTEND_DIR / "vite.config.ts",
+)
 DB_ROOT = ROOT / ".mysql"
 DB_PORT = 3307
 API_PORT = 8010
@@ -148,10 +158,35 @@ def stylize_log_message(message: str) -> Text:
     return text
 
 
+def _latest_mtime(path: Path) -> float:
+    if not path.exists():
+        return 0.0
+    if path.is_file():
+        return path.stat().st_mtime
+    latest = 0.0
+    for child in path.rglob("*"):
+        if child.is_file():
+            latest = max(latest, child.stat().st_mtime)
+    return latest
+
+
+def _frontend_build_reason() -> str | None:
+    if not FRONTEND_DIST.exists():
+        return "missing"
+    dist_mtime = FRONTEND_DIST.stat().st_mtime
+    source_mtime = max((_latest_mtime(path) for path in FRONTEND_BUILD_INPUTS), default=0.0)
+    if source_mtime > dist_mtime:
+        return "stale"
+    return None
+
+
 def ensure_frontend_build() -> None:
-    if FRONTEND_DIST.exists():
+    build_reason = _frontend_build_reason()
+    if build_reason is None:
         return
-    console.print("[yellow]Frontend build is missing. Building it now...[/yellow]")
+    console.print(
+        f"[yellow]Frontend build is {build_reason}. Building it now...[/yellow]"
+    )
     corepack = find_corepack_binary()
     if not corepack:
         raise SystemExit("Could not find corepack. Install Node.js with Corepack enabled.")
@@ -200,6 +235,11 @@ def port_is_open(port: int) -> bool:
         return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
+def ensure_port_available(port: int, label: str) -> None:
+    if port_is_open(port):
+        raise SystemExit(f"{label} port {port} is already in use.")
+
+
 def wait_for_port(port: int, timeout: float) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -213,16 +253,69 @@ def print_stage(message: str, style: str = "bright_blue") -> None:
     console.print(Text(message, style=style))
 
 
-def stop_listener(port: int) -> None:
-    subprocess.run(
-        ["cmd.exe", "/c", f'for /f "tokens=5" %P in (\'netstat -ano ^| findstr /R /C:":{port} .*LISTENING"\') do taskkill /PID %P /F'],
+def _listener_pids_for_port(port: int) -> list[int]:
+    completed = subprocess.run(
+        ["netstat", "-ano", "-p", "TCP"],
         cwd=ROOT,
-        stdout=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
+    target = f":{port}"
+    pids: list[int] = []
+    for raw_line in completed.stdout.splitlines():
+        line = raw_line.strip()
+        if "LISTENING" not in line or target not in line:
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        local_address = parts[1]
+        state = parts[3]
+        pid_text = parts[4]
+        if not local_address.endswith(target) or state != "LISTENING":
+            continue
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid not in pids:
+            pids.append(pid)
+    return pids
 
 
-def maybe_stop_existing(selected: set[str]) -> None:
+def stop_listener(port: int) -> None:
+    for pid in _listener_pids_for_port(port):
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/F"],
+            cwd=ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def _listener_pid_for_port(port: int) -> int | None:
+    pids = _listener_pids_for_port(port)
+    return pids[0] if pids else None
+
+
+def running_project_db_pid() -> int | None:
+    listener_pid = _listener_pid_for_port(DB_PORT)
+    if listener_pid is None:
+        return None
+    for pid_file in DB_ROOT.glob("*.pid"):
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue
+        if pid == listener_pid:
+            return pid
+    return None
+
+
+def maybe_stop_existing(selected: set[str], reusable_db_pid: int | None = None) -> None:
     ports: list[int] = []
     if "db" in selected:
         ports.append(DB_PORT)
@@ -230,7 +323,13 @@ def maybe_stop_existing(selected: set[str]) -> None:
         ports.append(API_PORT)
     if "frontend" in selected:
         ports.append(FRONTEND_PORT)
-    occupied = [port for port in ports if port_is_open(port)]
+    occupied = []
+    for port in ports:
+        if not port_is_open(port):
+            continue
+        if port == DB_PORT and reusable_db_pid is not None:
+            continue
+        occupied.append(port)
     if not occupied:
         return
     clear_screen()
@@ -246,7 +345,19 @@ def maybe_stop_existing(selected: set[str]) -> None:
         raise SystemExit(0)
     for port in occupied:
         stop_listener(port)
-    time.sleep(2)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        remaining = [port for port in occupied if port_is_open(port)]
+        if not remaining:
+            return
+        time.sleep(0.25)
+    still_busy = [port for port in occupied if port_is_open(port)]
+    if still_busy:
+        details = ", ".join(
+            f"{port} (PID {', '.join(str(pid) for pid in _listener_pids_for_port(port)) or 'unknown'})"
+            for port in still_busy
+        )
+        raise SystemExit(f"Could not stop existing listeners on: {details}")
 
 
 def prepare_db_permissions() -> None:
@@ -390,11 +501,15 @@ def wait_for_port_with_logs(
     output_queue: queue.Queue[tuple[str, str]],
     log_buffer: deque[Text],
     ready_message: str,
+    process: subprocess.Popen[str] | None = None,
 ) -> bool:
     started_at = time.time()
     last_status_tick = -1
     while time.time() - started_at < timeout:
         drain_output_queue(output_queue, log_buffer)
+        if process is not None and process.poll() is not None:
+            drain_output_queue(output_queue, log_buffer)
+            return False
         if port_is_open(port):
             print_stage(f"[{PROCESS_META[source]['label']}] {ready_message}", "bright_green")
             return True
@@ -509,7 +624,8 @@ def stop_processes(processes: dict[str, subprocess.Popen[str]]) -> None:
 
 def launch(mode: dict[str, object]) -> None:
     selected = set(mode["processes"])
-    maybe_stop_existing(selected)
+    reusable_db_pid = running_project_db_pid() if "db" in selected else None
+    maybe_stop_existing(selected, reusable_db_pid)
     output_queue: queue.Queue[tuple[str, str]] = queue.Queue()
     log_buffer: deque[Text] = deque(maxlen=LOG_LIMIT)
     threads: dict[str, threading.Thread] = {}
@@ -532,19 +648,28 @@ def launch(mode: dict[str, object]) -> None:
     processes: dict[str, subprocess.Popen[str]] = {}
     try:
         if "db" in selected:
-            print_stage("[DB ] starting local database", "bright_blue")
-            processes["db"] = start_db()
-            ensure_reader_thread("db", processes["db"], output_queue, threads)
-            if not wait_for_port_with_logs(
-                "db",
-                DB_PORT,
-                12,
-                output_queue,
-                log_buffer,
-                "database is online",
-            ):
-                raise SystemExit("Local database failed to start on port 3307.")
+            if reusable_db_pid is not None:
+                print_stage(
+                    f"[DB ] reusing existing local database on port 3307 (PID {reusable_db_pid})",
+                    "bright_green",
+                )
+            else:
+                ensure_port_available(DB_PORT, "Local database")
+                print_stage("[DB ] starting local database", "bright_blue")
+                processes["db"] = start_db()
+                ensure_reader_thread("db", processes["db"], output_queue, threads)
+                if not wait_for_port_with_logs(
+                    "db",
+                    DB_PORT,
+                    12,
+                    output_queue,
+                    log_buffer,
+                    "database is online",
+                    process=processes["db"],
+                ):
+                    raise SystemExit("Local database failed to start on port 3307.")
         if "api" in selected:
+            ensure_port_available(API_PORT, "Analyzer API")
             print_stage("[API] starting analyzer backend", "bright_blue")
             processes["api"] = start_api(str(mode["name"]))
             ensure_reader_thread("api", processes["api"], output_queue, threads)
@@ -555,9 +680,11 @@ def launch(mode: dict[str, object]) -> None:
                 output_queue,
                 log_buffer,
                 "analyzer API is online",
+                process=processes["api"],
             ):
                 raise SystemExit("Analyzer API failed to start on port 8010.")
         if "frontend" in selected:
+            ensure_port_available(FRONTEND_PORT, "Frontend dev server")
             print_stage("[WEB] starting Vite dev server", "bright_blue")
             processes["frontend"] = start_frontend()
             ensure_reader_thread("frontend", processes["frontend"], output_queue, threads)
@@ -568,6 +695,7 @@ def launch(mode: dict[str, object]) -> None:
                 output_queue,
                 log_buffer,
                 "frontend dev server is online",
+                process=processes["frontend"],
             ):
                 raise SystemExit("Frontend dev server failed to start on port 5173.")
         print_runtime_header(mode, selected)

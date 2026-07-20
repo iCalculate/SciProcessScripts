@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class GenerationCondition(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     curve_type: Literal["transfer"] = "transfer"
     material: str = "MoS2"
     polarity: Literal["n-type", "p-type"] = "n-type"
@@ -34,7 +36,6 @@ class GenerationCondition(BaseModel):
     contact_resistance_sigma_fraction: float = Field(0.15, ge=0.0, le=1.0)
     ai_residual_strength: float = Field(0.0, ge=0.0, le=1.0)
     gate_ai_residual_strength: float = Field(0.0, ge=0.0, le=1.0)
-    physical_strictness: float = Field(0.0, ge=0.0, le=1.0)
     diversity: float = Field(1.0, ge=0.0, le=1.0)
     seed: int = Field(12345, ge=0)
     voltage_min: float = -20.0
@@ -166,7 +167,17 @@ class TrainingResult(BaseModel):
 
 
 class NeuralTrainingResult(BaseModel):
-    method: Literal["physics_cvae", "latent_pca"] = "physics_cvae"
+    method: Literal[
+        "physics_cvae",
+        "aligned_local_delta_cvae",
+        "latent_pca",
+        "conditional_pca",
+        "threshold_conditional_pca",
+        "local_threshold_conditional_pca",
+        "aligned_local_threshold_conditional_pca",
+        "aligned_local_delta_conditional_pca",
+        "aligned_local_affine_delta_conditional_pca",
+    ] = "physics_cvae"
     curves: int
     gate_curves: int = 0
     generated_channels: list[Literal["Ids", "Ig"]] = Field(default_factory=lambda: ["Ids"])
@@ -206,7 +217,17 @@ class NeuralEpochMetric(BaseModel):
 
 class NeuralTrialSummary(BaseModel):
     trial: int
-    method: Literal["physics_cvae", "latent_pca"]
+    method: Literal[
+        "physics_cvae",
+        "aligned_local_delta_cvae",
+        "latent_pca",
+        "conditional_pca",
+        "threshold_conditional_pca",
+        "local_threshold_conditional_pca",
+        "aligned_local_threshold_conditional_pca",
+        "aligned_local_delta_conditional_pca",
+        "aligned_local_affine_delta_conditional_pca",
+    ]
     latent_dim: int
     hidden_dim: int
     learning_rate: float
@@ -218,7 +239,17 @@ class NeuralTrialSummary(BaseModel):
 
 
 class NeuralTrainingRequest(BaseModel):
-    method: Literal["physics_cvae", "latent_pca"] = "physics_cvae"
+    method: Literal[
+        "physics_cvae",
+        "aligned_local_delta_cvae",
+        "latent_pca",
+        "conditional_pca",
+        "threshold_conditional_pca",
+        "local_threshold_conditional_pca",
+        "aligned_local_threshold_conditional_pca",
+        "aligned_local_delta_conditional_pca",
+        "aligned_local_affine_delta_conditional_pca",
+    ] = "physics_cvae"
     search_strategy: Literal["single", "quick"] = "single"
     search_trials: int = Field(3, ge=1, le=8)
     data_source: Literal["export", "database"] = "export"
@@ -237,6 +268,7 @@ class NeuralTrainingRequest(BaseModel):
     subthreshold_weight: float = Field(2.5, ge=0, le=20)
     slope_weight: float = Field(0.10, ge=0, le=10)
     gate_loss_weight: float = Field(0.5, ge=0, le=10)
+    rare_curve_weight: float = Field(1.35, ge=1.0, le=10.0)
     pca_components: int = Field(12, ge=1, le=64)
     feature_eval_limit: int = Field(512, ge=0, le=10000)
 
@@ -336,4 +368,59 @@ class ModelInfo(BaseModel):
     source: str | None = None
     training_config: dict[str, Any] | None = None
     training_history: list[NeuralEpochMetric] = Field(default_factory=list)
+    condition_features: list[str] = Field(default_factory=list)
+    sample_balance_strategy: str | None = None
+    rare_curve_groups: int | None = None
     load_error: str | None = None
+
+
+class ExperimentLeaderboardEntry(BaseModel):
+    name: str
+    description: str | None = None
+    method: str
+    architecture: str | None = None
+    experiment_path: str
+    checkpoint_path: str | None = None
+    seconds: float | None = None
+    validation_rmse_decades: float | None = None
+    validation_weighted_rmse_decades: float | None = None
+    feature_vth_mae_v: float | None = None
+    feature_ss_mae_mv_dec: float | None = None
+    jump_p95_decades: float | None = None
+    jump_spike_rate: float | None = None
+    generated_vth_mae_v: float | None = None
+    generated_ss_mae_mv_dec: float | None = None
+    canonical_jump_p95_decades: float | None = None
+    canonical_jump_max_decades: float | None = None
+
+
+class ExperimentLeaderboardResponse(BaseModel):
+    entries: list[ExperimentLeaderboardEntry] = Field(default_factory=list)
+    best_jump_entry: ExperimentLeaderboardEntry | None = None
+    best_canonical_entry: ExperimentLeaderboardEntry | None = None
+    best_weighted_entry: ExperimentLeaderboardEntry | None = None
+    report_path: str | None = None
+    comparison_artifact_url: str | None = None
+
+
+class ModelComparisonRequest(BaseModel):
+    condition: GenerationCondition
+
+
+class ModelComparisonItem(BaseModel):
+    key: str
+    label: str
+    description: str
+    residual_mode: Literal["conditional_vae", "learned_pca", "procedural_prior"]
+    model_name: str
+    checkpoint_path: str | None = None
+    ai_residual_strength: float = Field(ge=0.0, le=1.0)
+    gate_ai_residual_strength: float = Field(ge=0.0, le=1.0)
+    model: ModelInfo
+    candidate: GeneratedCandidate
+    experiment_summary: ExperimentLeaderboardEntry | None = None
+
+
+class ModelComparisonResponse(BaseModel):
+    condition: GenerationCondition
+    items: list[ModelComparisonItem]

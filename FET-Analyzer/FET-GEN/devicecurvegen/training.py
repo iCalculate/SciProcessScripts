@@ -51,7 +51,6 @@ def train_residual_checkpoint(
                 hysteresis_v=0.0,
                 noise_sigma_a=0.0,
                 ai_residual_strength=0.0,
-                physical_strictness=1.0,
                 voltage_min=float(np.min(voltage)),
                 voltage_max=float(np.max(voltage)),
                 points=max(51, int(voltage.size)),
