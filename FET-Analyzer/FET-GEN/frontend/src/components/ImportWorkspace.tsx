@@ -28,7 +28,7 @@ const SERVER_PROGRESS_STEPS = [
 ] as const;
 
 type ImportTone = "idle" | "running" | "success";
-type OverviewMode = "assets" | "polarity" | "source" | "gate";
+type OverviewMode = "assets" | "polarity" | "source" | "belonger" | "gate";
 type HiddenOverviewState = Record<OverviewMode, string[]>;
 
 type ImportProgressState = {
@@ -165,9 +165,13 @@ function overviewItems(status: DatabaseStatus | null, mode: OverviewMode): Overv
       { key: "without-ig", label: "Without Ig", value: noGate, share: ratio(noGate, status.curves), tone: "blue" }
     ];
   }
-  const entries = Object.entries(
-    mode === "polarity" ? status.polarity_counts : status.source_kind_counts
-  ).sort((left, right) => right[1] - left[1]);
+  const countMap =
+    mode === "polarity"
+      ? status.polarity_counts
+      : mode === "belonger"
+        ? status.belonger_counts
+        : status.source_kind_counts;
+  const entries = Object.entries(countMap).sort((left, right) => right[1] - left[1]);
   const total = entries.reduce((sum, [, value]) => sum + value, 0);
   return entries.map(([key, value], index) => ({
     key,
@@ -224,6 +228,7 @@ export function ImportWorkspace() {
     assets: [],
     polarity: [],
     source: [],
+    belonger: [],
     gate: []
   });
   const [activeOverviewKey, setActiveOverviewKey] = useState<string | null>(null);
@@ -643,6 +648,7 @@ export function ImportWorkspace() {
               ["assets", "Asset mix"],
               ["polarity", "Polarity"],
               ["source", "Source kind"],
+              ["belonger", "Belonger"],
               ["gate", "Gate-current"]
             ] as const).map(([mode, label]) => (
               <button

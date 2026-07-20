@@ -398,6 +398,7 @@ export interface DatabaseStatus {
   rejected_entries: number;
   polarity_counts: Record<string, number>;
   source_kind_counts: Record<string, number>;
+  belonger_counts: Record<string, number>;
 }
 
 export interface DatabaseImportRequest {

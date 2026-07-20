@@ -1431,6 +1431,10 @@ def database_status(database_url: str | None = None) -> dict[str, Any]:
             )
         rejected_count = connection.scalar(select(func.count()).select_from(rejected_entries)) or 0
         source_count = connection.scalar(select(func.count()).select_from(source_files)) or 0
+        belonger_counts: dict[str, int] = {}
+        for source_path in connection.scalars(select(source_files.c.source_path)):
+            belonger = _source_belonger(str(source_path))
+            belonger_counts[belonger] = belonger_counts.get(belonger, 0) + 1
         polarity = dict(
             connection.execute(
                 select(curves.c.polarity, func.count()).group_by(curves.c.polarity)
@@ -1458,6 +1462,7 @@ def database_status(database_url: str | None = None) -> dict[str, Any]:
         "rejected_entries": int(rejected_count),
         "polarity_counts": polarity,
         "source_kind_counts": source_kinds,
+        "belonger_counts": belonger_counts,
     }
 
 
@@ -1467,6 +1472,13 @@ def _redact_url(url: str) -> str:
     prefix, suffix = url.rsplit("@", 1)
     scheme = prefix.split("://", 1)[0] if "://" in prefix else "mysql"
     return f"{scheme}://***@{suffix}"
+
+
+def _source_belonger(source_path: str) -> str:
+    normalized = str(source_path).replace("\\", "/").strip("/")
+    if not normalized:
+        return "Unknown"
+    return normalized.split("/", 1)[0] or "Unknown"
 
 
 def _curve_filter_conditions(filters: dict[str, Any]) -> list[Any]:

@@ -149,6 +149,7 @@ def test_database_schema_and_curve_browser_queries(tmp_path: Path) -> None:
     assert status["gate_points"] == 2
     assert status["aligned_gate_points"] == 2
     assert status["curves_with_ig"] == 1
+    assert status["belonger_counts"] == {"User": 1}
 
     listed = list_curves(url, polarity="n-type", has_gate_current="true")
     assert listed["total"] == 1
